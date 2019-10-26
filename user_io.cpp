@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
-#include <stdbool.h> 
+#include <stdbool.h>
 #include <fcntl.h>
 #include <time.h>
 #include <limits.h>
@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 
+#include "lib/lodepng/lodepng.h"
 #include "hardware.h"
 #include "osd.h"
 #include "user_io.h"
@@ -23,18 +24,21 @@
 #include "DiskImage.h"
 #include "brightness.h"
 #include "sxmlc.h"
-#include "tzx2wav.h"
 #include "bootcore.h"
 #include "charrom.h"
+#include "scaler.h"
+#include "miniz.h"
+#include "cheats.h"
+#include "video.h"
 
 #include "support.h"
 
 static char core_path[1024];
 
-uint8_t vol_att = 0;
+static uint8_t vol_att = 0;
 unsigned long vol_set_timeout = 0;
 
-fileTYPE sd_image[4] = {};
+static fileTYPE sd_image[4] = {};
 static uint64_t buffer_lba[4] = { ULLONG_MAX,ULLONG_MAX,ULLONG_MAX,ULLONG_MAX };
 
 // mouse and keyboard emulation state
@@ -54,6 +58,7 @@ static char caps_lock_toggle = 0;
 #define Y 1
 #define MOUSE_FREQ 20   // 20 ms -> 50hz
 static int16_t mouse_pos[2] = { 0, 0 };
+static int16_t mouse_wheel = 0;
 static uint8_t mouse_flags = 0;
 static unsigned long mouse_timer;
 
@@ -64,7 +69,73 @@ static bool caps_status = 0;
 static bool num_status = 0;
 static bool scrl_status = 0;
 
-static char minimig_adjust = 0;
+typedef struct
+{
+	bool track_active;
+	bool pregap_present;
+	uint8_t pre_m;		// Actual "PREGAP".
+	uint8_t pre_s;
+	uint8_t pre_f;
+	bool ind0_present;
+	uint8_t ind0_m;		// "Pregap" INDEX 00
+	uint8_t ind0_s;
+	uint8_t ind0_f;
+	uint8_t ind1_m;		// "Track Start" INDEX 01
+	uint8_t ind1_s;
+	uint8_t ind1_f;
+	uint8_t type;		// 0==AUDIO. 4==DATA.
+	int bytes_per_sec;
+} cd_track_t;
+
+// Track 1-99, so entry zero is unused / ignored.
+cd_track_t cd_trackinfo[100];
+
+uint8_t cd_first_track;
+uint8_t cd_last_track;
+
+static inline uint32_t msf_to_lba(uint8_t m, uint8_t s, uint8_t f)
+{
+	return (m*60*75) + (s*75) + f;
+}
+
+uint32_t dec_2_bcd(uint32_t a)
+{
+	uint32_t result = 0;
+	int shift = 0;
+
+	while (a != 0)
+	{
+		result |= (a % 10) << shift;
+		a /= 10;
+		shift += 4;
+	}
+	return result;
+}
+
+uint32_t bcd_2_dec(uint32_t a)
+{
+	uint32_t result = 0;
+	uint32_t scale = 1;
+
+	while (a != 0)
+	{
+		result += (a & 0x0f) * scale;
+		a >>= 4;
+		scale *= 10;
+	}
+	return result;
+}
+
+static char last_filename[1024] = {};
+void user_io_store_filename(char *filename)
+{
+	char *p = strrchr(filename, '/');
+	if (p) strcpy(last_filename, p + 1);
+	else strcpy(last_filename, filename);
+
+	p = strrchr(last_filename, '.');
+	if (p) *p = 0;
+}
 
 const char *get_image_name(int i)
 {
@@ -175,14 +246,25 @@ char is_snes_core()
 	return (is_snes_type == 1);
 }
 
+static int is_cpc_type = 0;
 char is_cpc_core()
 {
-	return !strcasecmp(core_name, "amstrad");
+	if (!is_cpc_type) is_cpc_type = strcasecmp(core_name, "amstrad") ? 2 : 1;
+	return (is_cpc_type == 1);
 }
 
+static int is_zx81_type = 0;
 char is_zx81_core()
 {
-	return !strcasecmp(core_name, "zx81");
+	if (!is_zx81_type) is_zx81_type = strcasecmp(core_name, "zx81") ? 2 : 1;
+	return (is_zx81_type == 1);
+}
+
+static int is_neogeo_type = 0;
+char is_neogeo_core()
+{
+	if (!is_neogeo_type) is_neogeo_type = strcasecmp(core_name, "neogeo") ? 2 : 1;
+	return (is_neogeo_type == 1);
 }
 
 static int is_no_type = 0;
@@ -200,6 +282,10 @@ static void user_io_read_core_name()
 	is_menu_type = 0;
 	is_x86_type  = 0;
 	is_no_type   = 0;
+	is_snes_type = 0;
+	is_cpc_type = 0;
+	is_zx81_type = 0;
+	is_neogeo_type = 0;
 	core_name[0] = 0;
 
 	// get core name
@@ -283,6 +369,8 @@ int user_io_get_joy_transl()
 	return joy_transl;
 }
 
+static int use_cheats = 0;
+
 static void parse_config()
 {
 	int i = 0;
@@ -297,8 +385,12 @@ static void parse_config()
 		{
 			OsdCoreNameSet(p);
 		}
+
 		if (i>=2 && p && p[0])
 		{
+			//skip Disable/Hide masks
+			while((p[0] == 'H' || p[0] == 'D') && strlen(p)>=2) p += 2;
+
 			if (p[0] == 'J')
 			{
 				int n = 1;
@@ -348,13 +440,18 @@ static void parse_config()
 				substrcpy(s + strlen(s), p, 1);
 				OsdCoreNameSet(s);
 			}
+
+			if (p[0] == 'C')
+			{
+				use_cheats = 1;
+			}
 		}
 		i++;
 	} while (p || i<3);
 }
 
 //MSM6242B layout
-void send_rtc(int type)
+static void send_rtc(int type)
 {
 	//printf("Update RTC\n");
 
@@ -507,7 +604,8 @@ void user_io_init(const char *path)
 	{
 		bootcore_init(path);
 	}
-	parse_video_mode();
+
+	video_mode_load();
 	if(strlen(cfg.font)) LoadFont(cfg.font);
 	FileLoadConfig("Volume.dat", &vol_att, 1);
 	vol_att &= 0x1F;
@@ -567,69 +665,81 @@ void user_io_init(const char *path)
 			}
 			parse_config();
 
-			if (is_x86_core())
+			if (is_menu_core())
 			{
-				x86_config_load();
-				x86_init();
+				user_io_8bit_set_status((cfg.menu_pal) ? 0x10 : 0, 0x10);
+				if (cfg.fb_terminal) video_menu_bg((status >> 1) & 7);
+				else user_io_8bit_set_status(0, 0xE);
 			}
 			else
 			{
-				if (!strlen(path) || !user_io_file_tx(path, 0, 0, 0, 1))
+				if (is_x86_core())
 				{
-					if (!is_cpc_core())
+					x86_config_load();
+					x86_init();
+				}
+				else
+				{
+					if (!strlen(path) || !user_io_file_tx(path, 0, 0, 0, 1))
 					{
-						// check for multipart rom
-						for (char i = 0; i < 4; i++)
+						if (!is_cpc_core())
 						{
-							sprintf(mainpath, "%s/boot%i.rom", user_io_get_core_name(), i);
-							user_io_file_tx(mainpath, i<<6);
+							// check for multipart rom
+							for (char i = 0; i < 4; i++)
+							{
+								sprintf(mainpath, "%s/boot%i.rom", user_io_get_core_name(), i);
+								user_io_file_tx(mainpath, i << 6);
+							}
 						}
+
+						// legacy style of rom
+						sprintf(mainpath, "%s/boot.rom", user_io_get_core_name());
+						if (!user_io_file_tx(mainpath))
+						{
+							strcpy(name + strlen(name) - 3, "ROM");
+							sprintf(mainpath, "%s/%s", get_rbf_dir(), name);
+							if (!get_rbf_dir()[0] || !user_io_file_tx(mainpath))
+							{
+								if (!user_io_file_tx(name))
+								{
+									sprintf(mainpath, "bootrom/%s", name);
+									user_io_file_tx(mainpath);
+								}
+							}
+						}
+
+						// cheats for boot file
+						if (user_io_use_cheats()) cheats_init("", user_io_get_file_crc());
 					}
 
-					// legacy style of rom
-					sprintf(mainpath, "%s/boot.rom", user_io_get_core_name());
-					if (!user_io_file_tx(mainpath))
+					if (is_cpc_core())
 					{
-						strcpy(name + strlen(name) - 3, "ROM");
-						sprintf(mainpath, "%s/%s", get_rbf_dir(), name);
-						if (!get_rbf_dir()[0] || !user_io_file_tx(mainpath))
+						for (int m = 0; m < 3; m++)
 						{
-							if (!user_io_file_tx(name))
+							const char *model = !m ? "" : (m == 1) ? "0" : "1";
+							sprintf(mainpath, "%s/boot%s.eZZ", user_io_get_core_name(), model);
+							user_io_file_tx(mainpath, 0x40 * (m + 1), 0, 1);
+							sprintf(mainpath, "%s/boot%s.eZ0", user_io_get_core_name(), model);
+							user_io_file_tx(mainpath, 0x40 * (m + 1), 0, 1);
+							for (int i = 0; i < 256; i++)
 							{
-								sprintf(mainpath, "bootrom/%s", name);
-								user_io_file_tx(mainpath);
+								sprintf(mainpath, "%s/boot%s.e%02X", user_io_get_core_name(), model, i);
+								user_io_file_tx(mainpath, 0x40 * (m + 1), 0, 1);
 							}
 						}
 					}
-				}
 
-				if (is_cpc_core())
-				{
-					for (int m = 0; m < 3; m++)
+					// check if vhd present
+					sprintf(mainpath, "%s/boot.vhd", user_io_get_core_name());
+					user_io_set_index(0);
+					if (!user_io_file_mount(mainpath))
 					{
-						const char *model = !m ? "" : (m == 1) ? "0" : "1";
-						sprintf(mainpath, "%s/boot%s.eZZ", user_io_get_core_name(), model);
-						user_io_file_tx(mainpath, 0x40 * (m + 1),0,1);
-						sprintf(mainpath, "%s/boot%s.eZ0", user_io_get_core_name(), model);
-						user_io_file_tx(mainpath, 0x40 * (m + 1),0,1);
-						for (int i = 0; i < 256; i++)
+						strcpy(name + strlen(name) - 3, "VHD");
+						sprintf(mainpath, "%s/%s", get_rbf_dir(), name);
+						if (!get_rbf_dir()[0] || !user_io_file_mount(mainpath))
 						{
-							sprintf(mainpath, "%s/boot%s.e%02X", user_io_get_core_name(), model, i);
-							user_io_file_tx(mainpath, 0x40 * (m + 1),0,1);
+							user_io_file_mount(name);
 						}
-					}
-				}
-
-				// check if vhd present
-				sprintf(mainpath, "%s/boot.vhd", user_io_get_core_name());
-				user_io_set_index(0);
-				if (!user_io_file_mount(mainpath))
-				{
-					strcpy(name + strlen(name) - 3, "VHD");
-					sprintf(mainpath, "%s/%s", get_rbf_dir(), name);
-					if (!get_rbf_dir()[0] || !user_io_file_mount(mainpath))
-					{
-						user_io_file_mount(name);
 					}
 				}
 			}
@@ -655,7 +765,7 @@ void user_io_init(const char *path)
 
 	char cmd[32];
 	system("uartmode 0");
-	
+
 	SetMidiLinkMode((mode >> 8) & 0xFF);
 	sprintf(cmd, "uartmode %d", mode & 0xFF);
 	system(cmd);
@@ -783,10 +893,11 @@ void user_io_sd_set_config(void)
 }
 
 // read 8+32 bit sd card status word from FPGA
-uint16_t user_io_sd_get_status(uint32_t *lba)
+uint16_t user_io_sd_get_status(uint32_t *lba, uint16_t *req_type)
 {
 	uint32_t s;
 	uint16_t c;
+	uint16_t req = 0;
 
 	spi_uio_cmd_cont(UIO_GET_SDSTAT);
 	if (io_ver)
@@ -794,6 +905,7 @@ uint16_t user_io_sd_get_status(uint32_t *lba)
 		c = spi_w(0);
 		s = spi_w(0);
 		s = (s & 0xFFFF) | (((uint32_t)spi_w(0))<<16);
+		req = spi_w(0);
 	}
 	else
 	{
@@ -803,11 +915,15 @@ uint16_t user_io_sd_get_status(uint32_t *lba)
 		s = (s << 8) | spi_in();
 		s = (s << 8) | spi_in();
 		s = (s << 8) | spi_in();
+		req = spi_in();
 	}
 	DisableIO();
 
 	if (lba)
 		*lba = s;
+
+	if (req)
+		*req_type = req;
 
 	return c;
 }
@@ -1239,7 +1355,7 @@ static void send_pcolchr(const char* name, unsigned char index, int type)
 	char *p = strrchr(full_path, '.');
 	if (!p) p = full_path + strlen(full_path);
 	strcpy(p, type ? ".chr" : ".col");
-	
+
 	if (type)
 	{
 		memcpy(col_attr, defchars, sizeof(defchars));
@@ -1273,6 +1389,35 @@ static void send_pcolchr(const char* name, unsigned char index, int type)
 		spi8(UIO_FILE_TX);
 		spi8(0x00);
 		DisableFpga();
+	}
+}
+
+static uint32_t file_crc;
+uint32_t user_io_get_file_crc()
+{
+	return file_crc;
+}
+
+int user_io_use_cheats()
+{
+	return use_cheats;
+}
+
+static void check_status_change()
+{
+	static u_int8_t last_status_change = 0;
+	char stchg = spi_uio_cmd_cont(UIO_GET_STATUS);
+	if ((stchg & 0xF0) == 0xA0 && last_status_change != (stchg & 0xF))
+	{
+		last_status_change = (stchg & 0xF);
+		uint32_t st = spi32w(0);
+		DisableIO();
+		user_io_8bit_set_status(st, ~UIO_STATUS_RESET);
+		//printf("** new status from core: %08X\n", st);
+	}
+	else
+	{
+		DisableIO();
 	}
 }
 
@@ -1316,51 +1461,55 @@ int user_io_file_tx(const char* name, unsigned char index, char opensave, char m
 	spi8(0xff);
 	DisableFpga();
 
-	if (strlen(f.name) > 4 && (!strcasecmp(f.name + strlen(f.name) - 4, ".tzx") || !strcasecmp(f.name + strlen(f.name) - 4, ".cdt")))
+	if (is_snes_core() && bytes2send)
 	{
-		printf("Processing TZX...\n");
+		printf("Load SNES ROM.\n");
+		uint8_t* buf = snes_get_header(&f);
+		hexdump(buf, 16, 0);
+		EnableFpga();
+		spi8(UIO_FILE_TX_DAT);
+		spi_write(buf, 512, fio_size);
+		DisableFpga();
+
+		//strip original SNES ROM header if present (not used)
+		if (bytes2send & 512)
+		{
+			bytes2send -= 512;
+			FileReadSec(&f, buf);
+		}
+	}
+
+	file_crc = 0;
+	uint32_t skip = bytes2send & 0x3FF; // skip possible header up to 1023 bytes
+
+	while (bytes2send)
+	{
+		printf(".");
+
+		uint16_t chunk = (bytes2send > sizeof(buf)) ? sizeof(buf) : bytes2send;
+
+		FileReadAdv(&f, buf, chunk);
 
 		EnableFpga();
 		spi8(UIO_FILE_TX_DAT);
-		tzx2csw(&f);
+		spi_write(buf, chunk, fio_size);
 		DisableFpga();
-	}
-	else
-	{
-		if (is_snes_core() && bytes2send)
+
+		bytes2send -= chunk;
+
+		if (skip >= chunk) skip -= chunk;
+		else
 		{
-			printf("Load SNES ROM.\n");
-			uint8_t* buf = snes_get_header(&f);
-			hexdump(buf, 16, 0);
-			EnableFpga();
-			spi8(UIO_FILE_TX_DAT);
-			spi_write(buf, 512, fio_size);
-			DisableFpga();
-
-			if (bytes2send & 512)
-			{
-				bytes2send -= 512;
-				FileReadSec(&f, buf);
-			}
+			file_crc = crc32(file_crc, buf + skip, chunk - skip);
+			skip = 0;
 		}
-
-		while (bytes2send)
-		{
-			printf(".");
-
-			uint16_t chunk = (bytes2send > sizeof(buf)) ? sizeof(buf) : bytes2send;
-
-			FileReadAdv(&f, buf, chunk);
-
-			EnableFpga();
-			spi8(UIO_FILE_TX_DAT);
-			spi_write(buf, chunk, fio_size);
-			DisableFpga();
-
-			bytes2send -= chunk;
-		}
-		printf("\n");
 	}
+
+	// check if core requests some change while downloading
+	check_status_change();
+
+	printf("\n");
+	printf("CRC32: %08X\n", file_crc);
 
 	FileClose(&f);
 
@@ -1438,7 +1587,7 @@ uint32_t user_io_8bit_set_status(uint32_t new_status, uint32_t mask)
 {
 	static uint32_t status = 0;
 
-	// if mask is 0 just return the current status 
+	// if mask is 0 just return the current status
 	if (mask) {
 		// keep everything not masked
 		status &= ~mask;
@@ -1452,37 +1601,51 @@ uint32_t user_io_8bit_set_status(uint32_t new_status, uint32_t mask)
 	return status;
 }
 
-char kbd_reset = 0;
-char old_video_mode = -1;
+static char cur_btn = 0;
+char user_io_menu_button()
+{
+	return (cur_btn & BUTTON_OSD) ? 1 : 0;
+}
 
+char user_io_user_button()
+{
+	return (cur_btn & BUTTON_USR) ? 1 : 0;
+}
+
+static char kbd_reset = 0;
 void user_io_send_buttons(char force)
 {
 	static unsigned short key_map = 0;
 	unsigned short map = 0;
 
-	int btn = fpga_get_buttons();
+	cur_btn = fpga_get_buttons();
 
-	if (btn & BUTTON_OSD) map |= BUTTON1;
-	else if(btn & BUTTON_USR) map |= BUTTON2;
+	if (user_io_menu_button()) map |= BUTTON1;
+	if (user_io_user_button()) map |= BUTTON2;
 	if (kbd_reset) map |= BUTTON2;
 
 	if (cfg.vga_scaler) map |= CONF_VGA_SCALER;
+	if (cfg.vga_sog) map |= CONF_VGA_SOG;
 	if (cfg.csync) map |= CONF_CSYNC;
 	if (cfg.ypbpr) map |= CONF_YPBPR;
 	if (cfg.forced_scandoubler) map |= CONF_FORCED_SCANDOUBLER;
 	if (cfg.hdmi_audio_96k) map |= CONF_AUDIO_96K;
 	if (cfg.dvi) map |= CONF_DVI;
+	if (cfg.hdmi_limited) map |= CONF_HDMI_LIMITED;
 
 	if ((map != key_map) || force)
 	{
-		if (is_archie())
+		if (is_archie() && (key_map & BUTTON2) && !(map & BUTTON2))
 		{
-			if ((key_map & BUTTON2) && !(map & BUTTON2))
-			{
-				const char *name = get_rbf_name();
-				fpga_load_rbf(name[0] ? name : "Archie.rbf");
-			}
+			const char *name = get_rbf_name();
+			fpga_load_rbf(name[0] ? name : "Archie.rbf");
 		}
+
+		if (is_minimig() && (key_map & BUTTON2) && !(map & BUTTON2))
+		{
+			minimig_reset();
+		}
+
 		key_map = map;
 		spi_uio_cmd16(UIO_BUT_SW, map);
 		printf("sending keymap: %X\n", map);
@@ -1490,22 +1653,22 @@ void user_io_send_buttons(char force)
 	}
 }
 
-uint32_t diskled_timer = 0;
-uint32_t diskled_is_on = 0;
-void __inline diskled_on()
+static uint32_t diskled_timer = 0;
+static uint32_t diskled_is_on = 0;
+void diskled_on()
 {
-	DISKLED_ON;
+	fpga_set_led(1);
 	diskled_timer = GetTimer(50);
 	diskled_is_on = 1;
 }
 
-void kbd_reply(char code)
+static void kbd_reply(char code)
 {
 	printf("kbd_reply = 0x%02X\n", code);
 	spi_uio_cmd16(UIO_KEYBOARD, 0xFF00 | code);
 }
 
-void mouse_reply(char code)
+static void mouse_reply(char code)
 {
 	printf("mouse_reply = 0x%02X\n", code);
 	spi_uio_cmd16(UIO_MOUSE, 0xFF00 | code);
@@ -1521,9 +1684,226 @@ void user_io_rtc_reset()
 
 static int coldreset_req = 0;
 
-static int adjust_video_mode(uint32_t vtime);
-static uint32_t show_video_info(int force);
 static uint32_t res_timer = 0;
+
+uint8_t cd_lba_to_track(uint32_t req_lba) {
+	uint8_t track=1;
+	for (track=1; track<=cd_last_track; track++) {
+		uint32_t toc_lba = msf_to_lba(cd_trackinfo[track].ind1_m, cd_trackinfo[track].ind1_s, cd_trackinfo[track].ind1_f);	// Convert track MSF to LBA.
+		//printf("TOC Track LBA: %08d\n", toc_lba);
+		if (req_lba > toc_lba) continue;	// See if the TOC LBA is > the requested LBA.
+		else break;
+	}
+	return track-1;	// The start LBA of the PREVIOUS track checked was lower than our requested LBA.
+}
+
+int cue_pt = 0;
+char cue_getch()
+{
+	static uint8_t buf[512];
+	if (!(cue_pt & 0x1ff)) FileReadSec(&sd_image[1], buf);
+	if (cue_pt >= sd_image[1].size) return 0;
+	return buf[(cue_pt++) & 0x1ff];
+}
+
+char cue_readline(char *buffer)
+{
+	char my_char = 0;
+	bool ret = 0;
+	int char_count = 0;
+
+	for (int i=0; i<1024; i++) {
+		ret = ( my_char = cue_getch() );
+		if (my_char!=0x20) {	// Ditch the spaces.
+			buffer[char_count] = my_char;
+			if (ret==0 || my_char==0x0A) {
+				buffer[char_count+1] = 0x00;	// Null terminator.
+				break;
+			}
+			else char_count++;
+		}
+	}
+	return ret;
+}
+
+void parse_cue_file(void)
+{
+	 int i_num, i_min, i_sec, i_frame, bytes_per_sec = 0;
+
+	// Clear the trackinfo before starting.
+	for (int i=0;i<=99;i++)
+	{
+		cd_trackinfo[i].track_active = 0;
+		cd_trackinfo[i].pregap_present = 0;
+		cd_trackinfo[i].pre_m = 0;
+		cd_trackinfo[i].pre_s = 0;
+		cd_trackinfo[i].pre_f = 0;
+		cd_trackinfo[i].ind0_present = 0;
+		cd_trackinfo[i].ind0_m = 0;
+		cd_trackinfo[i].ind0_s = 0;
+		cd_trackinfo[i].ind0_f = 0;
+		cd_trackinfo[i].ind1_m = 0;
+		cd_trackinfo[i].ind1_s = 0;
+		cd_trackinfo[i].ind1_f = 0;
+		cd_trackinfo[i].type = 0;
+		cd_trackinfo[i].bytes_per_sec = 0;
+	}
+
+	size_t i_tracks = 0;
+	char str[1024];
+	char type[5];
+
+	cue_pt = 0;	// Set cue file index to zero.
+
+	int track_num = 0;
+	bool first_track_done = 0;
+
+	// Note: strncmp==0 means a MATCH! Because reasons.
+
+    while( i_tracks < 99 )
+    {
+		if ( !cue_readline(str) ) break;	// Read in a whole line from the CUE file (until the end of the file).
+
+		if ( strncmp(str, "TRACK", 5)==0 ) {	// Is this a track?
+			sscanf( str, "%*5s%2u%5s%*1s%4u", &track_num, type, &bytes_per_sec);
+			if (!first_track_done) {
+				first_track_done = 1;
+				cd_first_track = track_num;
+			}
+		}
+
+		if ( strncmp(str, "PREGAP", 6)==0 )
+		{
+			sscanf( str, "%*6s%2u:%2u:%2u", &i_min, &i_sec, &i_frame );
+			cd_trackinfo[track_num].pregap_present = 1;
+			cd_trackinfo[track_num].pre_m = i_min;
+			cd_trackinfo[track_num].pre_s = i_sec;
+			cd_trackinfo[track_num].pre_f = i_frame;
+		}
+
+		if ( strncmp(str, "INDEX", 5)==0 )		// Is this an Index?
+        {
+			sscanf( str, "%*5s%2u%2u:%2u:%2u", &i_num, &i_min, &i_sec, &i_frame );
+
+			cd_trackinfo[track_num].track_active = 1;
+			if ( strcmp(type, "AUDIO")==0 ) {
+				cd_trackinfo[track_num].type = 0;
+				bytes_per_sec = 2352;		// Audio tracks assume 2352 bytes per sector, so it's not listed in the CUE file.
+			}
+			else if ( strcmp(type, "MODE1")==0 ) {
+				cd_trackinfo[track_num].type = 4;
+			}
+			cd_trackinfo[track_num].bytes_per_sec = bytes_per_sec;
+
+			/*
+			if (i_num==0) {	// "Pregap" index, sort of.
+				printf("Track:%02d  Pregap:%d  M:%02d  S:%02d  F:%02d  Type:%s  TOCtype:%d  BPS:%04d\n", track_num, cd_trackinfo[track_num].pregap_present, i_min, i_sec, i_frame, type, cd_trackinfo[track_num].type, bytes_per_sec);
+				cd_trackinfo[track_num].ind0_m = i_min;
+				cd_trackinfo[track_num].ind0_s = i_sec;
+				cd_trackinfo[track_num].ind0_f = i_frame;
+			}
+			*/
+
+			if (i_num==1) {	// "Track Start" index.
+				printf("Track:%02d  Pregap:%d  M:%02d  S:%02d  F:%02d  Type:%s  TOCtype:%d  BPS:%04d\n", track_num, cd_trackinfo[track_num].pregap_present, i_min, i_sec, i_frame, type, cd_trackinfo[track_num].type, bytes_per_sec);
+				cd_trackinfo[track_num].ind1_m = i_min;
+				cd_trackinfo[track_num].ind1_s = i_sec;
+				cd_trackinfo[track_num].ind1_f = i_frame;
+			}
+        }
+		i_tracks++;
+    }
+	cd_last_track = track_num;
+}
+
+void cd_generate_toc(uint16_t req_type, uint8_t *buffer)
+{
+	uint8_t m,s,f;
+	uint32_t lba;
+
+	switch ( (req_type&0xFF00)>>8 ) {
+		case 0xD0: {	// Request First Track and Last Track (BCD).
+			//buffer[0] = 0x01;	// Rondo - First track (BCD).
+			//buffer[1] = 0x22;	// Rondo - Last track (BCD).
+			buffer[0] = dec_2_bcd( cd_first_track );
+			buffer[1] = dec_2_bcd( cd_last_track );
+			buffer[2] = 0x00;	// Padding.
+			buffer[3] = 0x00;	// Padding.
+			printf("Core requesting CD TOC0. First Track:%02X. Last Track:%02X (BCD)\n", buffer[0], buffer[1]);
+		}; break;
+
+		case 0xD1: {	// Request Total Disk Size (MSF, in BCD).
+			//buffer[0] = 0x49;	// Rondo - Minutes = 0x49 (73).
+			//buffer[1] = 0x09;	// Rondo - Seconds = 0x09 (9).
+			//buffer[2] = 0x12;	// Rondo - Frames = 0x12 (18).
+
+			// ADD the PREGAP (if present).
+			/*
+			if (buffer[3]==4 && cd_trackinfo[track].pregap_present) {
+				m = cd_trackinfo[cd_last_track].ind1_m + cd_trackinfo[cd_last_track].pre_m;
+				s = cd_trackinfo[cd_last_track].ind1_s + cd_trackinfo[cd_last_track].pre_s;
+				f = cd_trackinfo[cd_last_track].ind1_f + cd_trackinfo[cd_last_track].pre_f;
+				// Not sure if audio tracks need the 2-second lead-in offset added? ElectronAsh.
+				uint32_t lba = msf_to_lba(m, s, f);	// Convert to LBA, so we can add the 2-second lead-in.
+				//lba += 2*75;						// Standard lead-in is 2 seconds (75 sectors per second, so 150).
+				// Convert back from LBA to MSF...
+				m = lba / (60 * 75);
+				lba -= m * (60 * 75);
+				s = lba / 75;
+				f = lba % 75;
+
+				buffer[0] = dec_2_bcd( m );
+				buffer[1] = dec_2_bcd( s );
+				buffer[2] = dec_2_bcd( f );
+			}
+			else
+			{*/
+				buffer[0] = dec_2_bcd( cd_trackinfo[cd_last_track].ind1_m );
+				buffer[1] = dec_2_bcd( cd_trackinfo[cd_last_track].ind1_s );
+				buffer[2] = dec_2_bcd( cd_trackinfo[cd_last_track].ind1_f );
+			//}
+			buffer[3] = 0x00;	// Padding.
+
+			printf("Core requesting CD TOC1. Total Disk Size:M:%02X S:%02X F:%02X (BCD)\n", buffer[0], buffer[1], buffer[2]);
+		}; break;
+
+		case 0xD2: {	// Request Track Info (Start MSF in BCD, and track type).
+			uint8_t track = bcd_2_dec(req_type&0xFF);	// Track number from req_type upper byte is in BCD!
+
+			//  If a DATA track, check for a pregap, and ADD it (if present).
+			if (cd_trackinfo[track].type==4 && cd_trackinfo[track].pregap_present) {
+				m = cd_trackinfo[track].ind1_m + cd_trackinfo[track].pre_m;
+				s = cd_trackinfo[track].ind1_s + cd_trackinfo[track].pre_s;
+				f = cd_trackinfo[track].ind1_f + cd_trackinfo[track].pre_f;
+
+				lba = msf_to_lba(m, s, f);	// Convert to LBA, so we can add the 2-second lead-in.
+				lba += 2*75;				// Standard lead-in is 2 seconds (75 sectors per second, so 150).
+
+				// Convert back from LBA to MSF...
+				m = lba / (60 * 75);
+				lba -= m * (60 * 75);
+				s = lba / 75;
+				f = lba % 75;
+
+				buffer[0] = dec_2_bcd( m );
+				buffer[1] = dec_2_bcd( s );
+				buffer[2] = dec_2_bcd( f );
+			}
+			else
+			{
+				buffer[0] = dec_2_bcd( cd_trackinfo[track].ind1_m );
+				buffer[1] = dec_2_bcd( cd_trackinfo[track].ind1_s );
+				buffer[2] = dec_2_bcd( cd_trackinfo[track].ind1_f );
+			}
+			buffer[3] = cd_trackinfo[track].type;
+
+			printf("Core requesting CD TOC2. Track:%02d. M:%02X S:%02X F:%02X (BCD). Type:", track, buffer[0], buffer[1], buffer[2]);
+			if (buffer[3]==0x00) printf("AUDIO\n");
+			else if (buffer[3]==0x04) printf("DATA\n");
+			else printf("UNKNOWN!\n");
+		}; break;
+	}
+}
 
 void user_io_poll()
 {
@@ -1544,7 +1924,7 @@ void user_io_poll()
 
 		// check for incoming serial data. this is directly forwarded to the
 		// arm rs232 and mixes with debug output. Useful for debugging only of
-		// e.g. the diagnostic cartridge    
+		// e.g. the diagnostic cartridge
 		spi_uio_cmd_cont(UIO_SERIAL_IN);
 		while (spi_in())
 		{
@@ -1648,7 +2028,7 @@ void user_io_poll()
 		tos_poll();
 	}
 
-	if (core_type == CORE_TYPE_8BIT)
+	if (core_type == CORE_TYPE_8BIT && !is_menu_core())
 	{
 		/*
 		unsigned char c = 1, f, p = 0;
@@ -1676,20 +2056,7 @@ void user_io_poll()
 		DisableIO();
 		*/
 
-		static u_int8_t last_status_change = 0;
-		char stchg = spi_uio_cmd_cont(UIO_GET_STATUS);
-		if ((stchg & 0xF0) == 0xA0 && last_status_change != (stchg & 0xF))
-		{
-			last_status_change = (stchg & 0xF);
-			uint32_t st = spi32w(0);
-			DisableIO();
-			user_io_8bit_set_status(st, ~UIO_STATUS_RESET);
-			//printf("** new status from core: %08X\n", st);
-		}
-		else
-		{
-			DisableIO();
-		}
+		check_status_change();
 	}
 
 	// sd card emulation
@@ -1697,11 +2064,12 @@ void user_io_poll()
 	{
 		x86_poll();
 	}
-	else if (core_type == CORE_TYPE_8BIT || core_type == CORE_TYPE_ARCHIE)
+	else if ((core_type == CORE_TYPE_8BIT || core_type == CORE_TYPE_ARCHIE) && !is_menu_core())
 	{
 		static uint8_t buffer[4][512];
 		uint32_t lba;
-		uint16_t c = user_io_sd_get_status(&lba);
+		uint16_t req_type = 0;
+		uint16_t c = user_io_sd_get_status(&lba, &req_type);
 		//if(c&3) printf("user_io_sd_get_status: cmd=%02x, lba=%08x\n", c, lba);
 
 		// valid sd commands start with "5x" to avoid problems with
@@ -1790,18 +2158,111 @@ void user_io_poll()
 				//printf("SD RD %d on %d, WIDE=%d\n", lba, disk, fio_size);
 
 				int done = 0;
-
-				if (buffer_lba[disk] != lba)
+				if (is_neogeo_core())
 				{
+					uint32_t offset = 0;
+
 					if (sd_image[disk].size)
 					{
 						diskled_on();
-						if (FileSeekLBA(&sd_image[disk], lba))
+						printf("req_type: 0x%04X  ", req_type);
+						switch ((req_type & 0xFF00) >> 8)
 						{
-							if (FileReadSec(&sd_image[disk], buffer[disk]))
+						case 0xD0:case 0xD1:case 0xD2:
+						{
+							cd_generate_toc(req_type, buffer[disk]);
+							done = 1;
+						};
+						break;
+
+						case 0x48:
+						{
+							// Added this, Neo CD always requests by MSF (furrtek)
+							if ((req_type & 0xFF) == 0x01)
 							{
-								done = 1;
+								printf("Neo CD requested raw lba value (MSF): 0x%08X\n", lba);
+								uint8_t m = bcd_2_dec((lba & 0xFF0000) >> 16);
+								uint8_t s = bcd_2_dec((lba & 0xFF00) >> 8);
+								uint8_t f = bcd_2_dec((lba & 0xFF) >> 0);
+								lba = msf_to_lba(m, s, f);
+								lba -= (2 * 75); // Remove 2 second pregap
 							}
+
+							uint8_t track = cd_lba_to_track(lba);
+							uint16_t bps = cd_trackinfo[track].bytes_per_sec;
+							uint32_t pregap = 0;
+
+							if (cd_trackinfo[track].pregap_present)
+							{
+								pregap = msf_to_lba(cd_trackinfo[track].pre_m, cd_trackinfo[track].pre_s, cd_trackinfo[track].pre_f);
+							}
+
+							if (bps == 2352) offset = 16 + ((lba - pregap) * 2352);		// Rondo etc.
+							else if (bps == 2048) offset = ((lba - pregap) * 2048);	// Homebrew, etc.
+							else printf("Data track %02d has unhandled bytes-per-sec of %d !\n", track, bps);
+
+							if (FileSeek(&sd_image[disk], offset, SEEK_SET))
+							{
+								if (FileReadAdv(&sd_image[disk], buffer[disk], 2048)) done = 1;
+							}
+							printf("Core requesting 2048-byte CD sector, from LBA: 0x%08X  TRACK: %02d  BPS: %04d  OFFSET: 0x%08X \n", lba, track, bps, offset);
+						};
+						break;
+
+						case 0x52:
+						{
+							switch (req_type & 0xFF)
+							{
+								// "lba" holds the LBA. Dun do nothing. (no conversion needed).
+							case 0x00:
+								break;
+
+								// "lba" holds the MSF (BCD). Convert to LBA.
+							case 0x01:
+							{
+								uint8_t m = bcd_2_dec((lba & 0xFF0000) >> 16);
+								uint8_t s = bcd_2_dec((lba & 0xFF00) >> 8);
+								uint8_t f = bcd_2_dec((lba & 0xFF) >> 0);
+								lba = msf_to_lba(m, s, f);
+							};
+							break;
+
+							// "lba" holds the TRACK number (BCD?). Grab the track start MSF from the TOC, then convert to LBA.
+							case 0x02:
+							{
+								uint8_t track = bcd_2_dec(lba);
+								lba = msf_to_lba(cd_trackinfo[track].ind1_m, cd_trackinfo[track].ind1_s, cd_trackinfo[track].ind1_f);
+							};
+							break;
+							}
+
+							uint8_t track = cd_lba_to_track(lba);
+
+							if (cd_trackinfo[track].type != 0x00)
+							{
+								printf("Error: Core is trying to play back non-audio track as CDDA!\n");
+								memset(buffer[disk], 0, sizeof(buffer[disk]));
+							}
+							else
+							{
+								if (FileSeek(&sd_image[disk], (lba - 525) * 2352, SEEK_SET))
+								{
+									if (FileReadAdv(&sd_image[disk], buffer[disk], 2352)) done = 1;
+								}
+							}
+							printf("Core requesting a raw 2352-byte CD sector, from LBA: 0x%08X  TRACK: %02d\n", lba, track);
+						};
+						break;
+
+						default:
+						{
+							if (FileSeekLBA(&sd_image[disk], lba))
+							{
+								if (FileReadSec(&sd_image[disk], buffer[disk])) done = 1;
+							}
+							printf("Core requesting a 512-byte SD / VHD sector, from LBA: 0x%08X\n", lba);
+						};
+						break;
 						}
 					}
 
@@ -1809,49 +2270,72 @@ void user_io_poll()
 					//Give an empty block.
 					if (!done) memset(buffer[disk], 0, sizeof(buffer[disk]));
 					buffer_lba[disk] = lba;
-				}
 
-				if(buffer_lba[disk] == lba)
-				{
-					//hexdump(buffer, 32, 0);
-
-					// data is now stored in buffer. send it to fpga
 					spi_uio_cmd_cont(UIO_SECTOR_RD);
-					spi_block_write(buffer[disk], fio_size);
+					if ((req_type & 0xF000) == 0xD000) spi_write(buffer[disk], 4, fio_size);			// TOC. (4 bytes, including padding).
+					else if ((req_type & 0xFF00) == 0x4800) spi_write(buffer[disk], 2048, fio_size);	// 2048-byte CD sector.
+					else if ((req_type & 0xFF00) == 0x5200) spi_write(buffer[disk], 2352, fio_size);	// 2352-byte CD sector.
+					else spi_write(buffer[disk], 512, fio_size);									// Standard 512-byte SD / VHD sector.
 					DisableIO();
 				}
-
-				// just load the next sector now, so it may be prefetched
-				// for the next request already
-				done = 0;
-				if (sd_image[disk].size)
+				else
 				{
-					diskled_on();
-					if (FileSeekLBA(&sd_image[disk], lba + 1))
+					if (buffer_lba[disk] != lba)
 					{
-						if (FileReadSec(&sd_image[disk], buffer[disk]))
+						if (sd_image[disk].size)
 						{
-							done = 1;
+							diskled_on();
+							if (FileSeekLBA(&sd_image[disk], lba))
+							{
+								if (FileReadSec(&sd_image[disk], buffer[disk]))
+								{
+									done = 1;
+								}
+							}
+						}
+
+						//Even after error we have to provide the block to the core
+						//Give an empty block.
+						if (!done) memset(buffer[disk], 0, sizeof(buffer[disk]));
+						buffer_lba[disk] = lba;
+					}
+
+					if (buffer_lba[disk] == lba)
+					{
+						//hexdump(buffer, 32, 0);
+
+						// data is now stored in buffer. send it to fpga
+						spi_uio_cmd_cont(UIO_SECTOR_RD);
+						spi_block_write(buffer[disk], fio_size);
+						DisableIO();
+					}
+
+					// just load the next sector now, so it may be prefetched
+					// for the next request already
+					done = 0;
+					if (sd_image[disk].size)
+					{
+						diskled_on();
+						if (FileSeekLBA(&sd_image[disk], lba + 1))
+						{
+							if (FileReadSec(&sd_image[disk], buffer[disk]))
+							{
+								done = 1;
+							}
 						}
 					}
-				}
-				if(done) buffer_lba[disk] = lba + 1;
+					if (done) buffer_lba[disk] = lba + 1;
 
-				if (sd_image[disk].type == 2)
-				{
-					buffer_lba[disk] = -1;
+					if (sd_image[disk].type == 2)
+					{
+						buffer_lba[disk] = -1;
+					}
 				}
 			}
 		}
-
-		if(diskled_is_on && CheckTimer(diskled_timer))
-		{
-			DISKLED_OFF;
-			diskled_is_on = 0;
-		}
 	}
 
-	if (core_type == CORE_TYPE_8BIT)
+	if (core_type == CORE_TYPE_8BIT && !is_menu_core())
 	{
 		// frequently check ps2 mouse for events
 		if (CheckTimer(mouse_timer))
@@ -1863,7 +2347,7 @@ void user_io_poll()
 			{
 				unsigned char ps2_mouse[3];
 
-				// PS2 format: 
+				// PS2 format:
 				// YOvfl, XOvfl, dy8, dx8, 1, mbtn, rbtn, lbtn
 				// dx[7:0]
 				// dy[7:0]
@@ -1909,24 +2393,34 @@ void user_io_poll()
 					ps2_mouse[2] = mouse_pos[Y];
 				}
 
+				int16_t ps2_wheel = mouse_wheel;
+				if (ps2_wheel > 63) ps2_wheel = 63;
+				else if (ps2_wheel < -63) ps2_wheel = -63;
+
 				// collect movement info and send at predefined rate
-				if (is_menu_core() && !(ps2_mouse[0] == 0x08 && ps2_mouse[1] == 0 && ps2_mouse[2] == 0))
-					printf("PS2 MOUSE: %x %d %d\n", ps2_mouse[0], ps2_mouse[1], ps2_mouse[2]);
+				if (is_menu_core() && !video_fb_state()) printf("PS2 MOUSE: %x %d %d %d\n", ps2_mouse[0], ps2_mouse[1], ps2_mouse[2], ps2_wheel);
 
 				if (!osd_is_visible)
 				{
 					spi_uio_cmd_cont(UIO_MOUSE);
-					spi8(ps2_mouse[0]);
-					spi8(ps2_mouse[1]);
-					spi8(ps2_mouse[2]);
+					spi_w(ps2_mouse[0] | ((ps2_wheel&127)<<8));
+					spi_w(ps2_mouse[1]);
+					spi_w(ps2_mouse[2]);
 					DisableIO();
 				}
 
 				// reset counters
 				mouse_flags = 0;
-				mouse_pos[X] = mouse_pos[Y] = 0;
+				mouse_pos[X] = mouse_pos[Y] = mouse_wheel = 0;
 			}
 		}
+	}
+
+	if (is_neogeo_core() && (!rtc_timer || CheckTimer(rtc_timer)))
+	{
+		// Update once per minute should be enough
+		rtc_timer = GetTimer(60000);
+		send_rtc(1);
 	}
 
 	if (core_type == CORE_TYPE_ARCHIE) archie_poll();
@@ -2065,7 +2559,7 @@ void user_io_poll()
 		}
 	}
 
-	if (CheckTimer(led_timer))
+	if (CheckTimer(led_timer) && !is_menu_core())
 	{
 		led_timer = GetTimer(LED_FREQ);
 		if (!use_ps2ctl)
@@ -2096,15 +2590,9 @@ void user_io_poll()
 	else if(CheckTimer(res_timer))
 	{
 		res_timer = GetTimer(500);
-		if (!minimig_adjust)
+		if (!minimig_get_adjust())
 		{
-			uint32_t vtime = show_video_info(0);
-			if (vtime && cfg.vsync_adjust && !is_menu_core())
-			{
-				adjust_video_mode(vtime);
-				usleep(100000);
-				show_video_info(1);
-			}
+			video_mode_adjust();
 		}
 	}
 
@@ -2131,29 +2619,12 @@ void user_io_poll()
 		vol_set_timeout = 0;
 		FileSaveConfig("Volume.dat", &vol_att, 1);
 	}
-}
 
-char user_io_menu_button()
-{
-	return((fpga_get_buttons() & BUTTON_OSD) ? 1 : 0);
-}
-
-char user_io_user_button()
-{
-	return((!user_io_menu_button() && (fpga_get_buttons() & BUTTON_USR)) ? 1 : 0);
-}
-
-static void adjust_vsize(char force);
-static void store_vsize();
-void user_io_minimig_set_adjust(char n)
-{
-	if (minimig_adjust & !n) store_vsize();
-	minimig_adjust = n;
-}
-
-char user_io_minimig_get_adjust()
-{
-	return minimig_adjust;
+	if (diskled_is_on && CheckTimer(diskled_timer))
+	{
+		fpga_set_led(0);
+		diskled_is_on = 0;
+	}
 }
 
 static void send_keycode(unsigned short key, int press)
@@ -2186,11 +2657,11 @@ static void send_keycode(unsigned short key, int press)
 		}
 
 		code &= 0xff;
-		if (minimig_adjust)
+		if (minimig_get_adjust())
 		{
 			if (code == 0x44)
 			{
-				store_vsize();
+				minimig_set_adjust(0);
 				res_timer = 0;
 				return;
 			}
@@ -2199,8 +2670,7 @@ static void send_keycode(unsigned short key, int press)
 			{
 				Info("Canceled");
 				res_timer = 0;
-				minimig_adjust = 0;
-				adjust_vsize(1);
+				minimig_set_adjust(2);
 				return;
 			}
 			code |= OSD;
@@ -2361,7 +2831,7 @@ static void send_keycode(unsigned short key, int press)
 	}
 }
 
-void user_io_mouse(unsigned char b, int16_t x, int16_t y)
+void user_io_mouse(unsigned char b, int16_t x, int16_t y, int16_t w)
 {
 	switch (core_type)
 	{
@@ -2374,6 +2844,7 @@ void user_io_mouse(unsigned char b, int16_t x, int16_t y)
 	case CORE_TYPE_8BIT:
 		mouse_pos[X] += x;
 		mouse_pos[Y] -= y;  // ps2 y axis is reversed over usb
+		mouse_wheel += w;
 		mouse_flags |= 0x08 | (b & 7);
 		return;
 
@@ -2417,7 +2888,7 @@ void user_io_check_reset(unsigned short modifiers, char useKeys)
 		switch (core_type)
 		{
 		case CORE_TYPE_MINIMIG2:
-			MinimigReset();
+			minimig_reset();
 			break;
 
 		case CORE_TYPE_ARCHIE:
@@ -2435,8 +2906,9 @@ void user_io_check_reset(unsigned short modifiers, char useKeys)
 
 void user_io_osd_key_enable(char on)
 {
-	printf("OSD is now %s\n", on ? "visible" : "invisible");
+	//printf("OSD is now %s\n", on ? "visible" : "invisible");
 	osd_is_visible = on;
+	input_switch(-1);
 }
 
 int get_volume()
@@ -2479,6 +2951,40 @@ void user_io_kbd(uint16_t key, int press)
 {
 	if(is_menu_core()) spi_uio_cmd(UIO_KEYBOARD); //ping the Menu core to wakeup
 
+	// Win+PrnScr or Alt/Win+ScrLk - screen shot
+	if ((key == KEY_SYSRQ && (get_key_mod() & (RGUI | LGUI))) || (key == KEY_SCROLLLOCK && (get_key_mod() & (LALT | RALT | RGUI | LGUI))))
+	{
+		if (press == 1)
+		{
+			printf("print key pressed - do screen shot\n");
+			mister_scaler *ms = mister_scaler_init();
+			if (ms == NULL)
+			{
+				printf("problem with scaler, maybe not a new enough version\n");
+				Info("Scaler not compatible");
+			}
+			else
+			{
+				unsigned char *outputbuf = (unsigned char *)calloc(ms->width*ms->height * 3, 1);
+				mister_scaler_read(ms, outputbuf);
+				static char filename[1024];
+				FileGenerateScreenshotName(last_filename, filename, 1024);
+				unsigned error = lodepng_encode24_file(getFullPath(filename), outputbuf, ms->width, ms->height);
+				if (error) {
+					printf("error %u: %s\n", error, lodepng_error_text(error));
+					printf("%s", filename);
+					Info("error in saving png");
+				}
+				free(outputbuf);
+				mister_scaler_free(ms);
+				char msg[1024];
+				snprintf(msg, 1024, "Screen saved to\n%s", filename + strlen(SCREENSHOT_DIR"/"));
+				Info(msg);
+			}
+		}
+
+	}
+	else
 	if (key == KEY_MUTE)
 	{
 		if (press == 1 && hasAPI1_5()) set_volume(0);
@@ -2510,18 +3016,13 @@ void user_io_kbd(uint16_t key, int press)
 		PrintDirectory();
 	}
 	else
-	if ((core_type == CORE_TYPE_MINIMIG2) ||
-		(core_type == CORE_TYPE_MIST) ||
-		(core_type == CORE_TYPE_ARCHIE) ||
-		(core_type == CORE_TYPE_SHARPMZ) ||
-		(core_type == CORE_TYPE_8BIT))
 	{
 		if (key)
 		{
 			uint32_t code = get_ps2_code(key);
 			if (!press)
 			{
-				if (is_menu_core()) printf("PS2 code(break)%s for core: %d(0x%X)\n", (code & EXT) ? "(ext)" : "", code & 255, code & 255);
+				if (is_menu_core() && !video_fb_state()) printf("PS2 code(break)%s for core: %d(0x%X)\n", (code & EXT) ? "(ext)" : "", code & 255, code & 255);
 
 				if (key == KEY_MENU) key = KEY_F12;
 				if (osd_is_visible) menu_key_set(UPSTROKE | key);
@@ -2531,7 +3032,7 @@ void user_io_kbd(uint16_t key, int press)
 			}
 			else
 			{
-				if (is_menu_core()) printf("PS2 code(make)%s for core: %d(0x%X)\n", (code & EXT) ? "(ext)" : "", code & 255, code & 255);
+				if (is_menu_core() && !video_fb_state()) printf("PS2 code(make)%s for core: %d(0x%X)\n", (code & EXT) ? "(ext)" : "", code & 255, code & 255);
 				if (!osd_is_visible && !is_menu_core() && key == KEY_MENU && press == 3) open_joystick_setup();
 				else if ((has_menu() || osd_is_visible || (get_key_mod() & (LALT | RALT | RGUI | LGUI))) && (((key == KEY_F12) && ((!is_x86_core() && !is_archie()) || (get_key_mod() & (RGUI | LGUI)))) || key == KEY_MENU)) menu_key_set(KEY_F12);
 				else if (osd_is_visible)
@@ -2540,7 +3041,7 @@ void user_io_kbd(uint16_t key, int press)
 				}
 				else
 				{
-					if ((code & EMU_SWITCH_1) || ((code & EMU_SWITCH_2) && !use_ps2ctl && !is_archie()))
+					if (((code & EMU_SWITCH_1) || ((code & EMU_SWITCH_2) && !use_ps2ctl && !is_archie())) && !is_menu_core())
 					{
 						if (press == 1)
 						{
@@ -2584,7 +3085,7 @@ void user_io_kbd(uint16_t key, int press)
 					else
 					{
 						if(key == KEY_MENU) key = KEY_F12;
-						send_keycode(key, press);
+						if(input_state()) send_keycode(key, press);
 					}
 				}
 			}
@@ -2631,579 +3132,4 @@ unsigned char user_io_ext_idx(char *name, char* ext)
 
 	printf("not found! use 0\n");
 	return 0;
-}
-
-struct vmode_t
-{
-	uint32_t vpar[8];
-	double Fpix;
-};
-
-vmode_t vmodes[] =
-{
-	{ { 1280, 110,  40, 220,  720,  5,  5, 20 },  74.25  }, //0
-	{ { 1024,  24, 136, 160,  768,  3,  6, 29 },  65     }, //1
-	{ {  720,  16,  62,  60,  480,  9,  6, 30 },  27     }, //2
-	{ {  720,  12,  64,  68,  576,  5,  5, 39 },  27     }, //3
-	{ { 1280,  48, 112, 248, 1024,  1,  3, 38 }, 108     }, //4
-	{ {  800,  40, 128,  88,  600,  1,  4, 23 },  40     }, //5
-	{ {  640,  16,  96,  48,  480, 10,  2, 33 },  25.175 }, //6
-	{ { 1280, 440,  40, 220,  720,  5,  5, 20 },  74.25  }, //7
-	{ { 1920,  88,  44, 148, 1080,  4,  5, 36 }, 148.5   }, //8
-	{ { 1920, 528,  44, 148, 1080,  4,  5, 36 }, 148.5   }, //9
-	{ { 1366,  70, 143, 213,  768,  3,  3, 24 },  85.5   }, //10
-	{ { 1024,  40, 104, 144,  600,  1,  3, 18 },  48.96  }, //11
-};
-#define VMODES_NUM (sizeof(vmodes) / sizeof(vmodes[0]))
-
-struct vmode_custom_t
-{
-	uint32_t item[32];
-	double Fpix;
-};
-
-static vmode_custom_t v_cur = {}, v_def = {}, v_pal = {}, v_ntsc = {};
-static int vmode_def = 0, vmode_pal = 0, vmode_ntsc = 0;
-
-static uint32_t getPLLdiv(uint32_t div)
-{
-	if (div & 1) return 0x20000 | (((div / 2) + 1) << 8) | (div / 2);
-	return ((div / 2) << 8) | (div / 2);
-}
-
-static int findPLLpar(double Fout, uint32_t *pc, uint32_t *pm, double *pko)
-{
-	uint32_t c = 1;
-	while ((Fout*c) < 400) c++;
-
-	while (1)
-	{
-		double fvco = Fout*c;
-		uint32_t m = (uint32_t)(fvco / 50);
-		double ko = ((fvco / 50) - m);
-
-		fvco = ko + m;
-		fvco *= 50.f;
-
-		if (ko && (ko <= 0.05f || ko >= 0.95f))
-		{
-			printf("Fvco=%f, C=%d, M=%d, K=%f ", fvco, c, m, ko);
-			if (fvco > 1500.f)
-			{
-				printf("-> No exact parameters found\n");
-				return 0;
-			}
-			printf("-> K is outside allowed range\n");
-			c++;
-		}
-		else
-		{
-			*pc = c;
-			*pm = m;
-			*pko = ko;
-			return 1;
-		}
-	}
-
-	//will never reach here
-	return 0;
-}
-
-static void setPLL(double Fout, vmode_custom_t *v)
-{
-	double Fpix;
-	double fvco, ko;
-	uint32_t m, c;
-
-	printf("Calculate PLL for %.4f MHz:\n", Fout);
-
-	if (!findPLLpar(Fout, &c, &m, &ko))
-	{
-		c = 1;
-		while ((Fout*c) < 400) c++;
-
-		fvco = Fout*c;
-		m = (uint32_t)(fvco / 50);
-		ko = ((fvco / 50) - m);
-
-		//Make sure K is in allowed range.
-		if (ko <= 0.05f)
-		{
-			ko = 0;
-		}
-		else if (ko >= 0.95f)
-		{
-			m++;
-			ko = 0;
-		}
-	}
-
-	uint32_t k = ko ? (uint32_t)(ko * 4294967296) : 1;
-
-	fvco = ko + m;
-	fvco *= 50.f;
-	Fpix = fvco / c;
-
-	printf("Fvco=%f, C=%d, M=%d, K=%f(%u) -> Fpix=%f\n", fvco, c, m, ko, k, Fpix);
-
-	v->item[9]  = 4;
-	v->item[10] = getPLLdiv(m);
-	v->item[11] = 3;
-	v->item[12] = 0x10000;
-	v->item[13] = 5;
-	v->item[14] = getPLLdiv(c);
-	v->item[15] = 9;
-	v->item[16] = 2;
-	v->item[17] = 8;
-	v->item[18] = 7;
-	v->item[19] = 7;
-	v->item[20] = k;
-
-	v->Fpix = Fpix;
-}
-
-static char scaler_flt_cfg[1024] = { 0 };
-static char new_scaler = 0;
-
-static void setScaler()
-{
-	fileTYPE f = {};
-	static char filename[1024];
-
-	if (!spi_uio_cmd_cont(UIO_SET_FLTNUM))
-	{
-		DisableIO();
-		return;
-	}
-
-	new_scaler = 1;
-	spi8(scaler_flt_cfg[0]);
-	DisableIO();
-	sprintf(filename, COEFF_DIR"/%s", scaler_flt_cfg + 1);
-
-	if (FileOpen(&f, filename))
-	{
-		printf("Read scaler coefficients\n");
-		char *buf = (char*)malloc(f.size+1);
-		if (buf)
-		{
-			memset(buf, 0, f.size + 1);
-			int size;
-			if ((size = FileReadAdv(&f, buf, f.size)))
-			{
-				spi_uio_cmd_cont(UIO_SET_FLTCOEF);
-
-				char *end = buf + size;
-				char *pos = buf;
-				int phase = 0;
-				while (pos < end)
-				{
-					char *st = pos;
-					while ((pos < end) && *pos && (*pos != 10)) pos++;
-					*pos = 0;
-					while (*st == ' ' || *st == '\t' || *st == 13) st++;
-					if (*st == '#' || *st == ';' || !*st) pos++;
-					else
-					{
-						int c0, c1, c2, c3;
-						int n = sscanf(st, "%d,%d,%d,%d", &c0, &c1, &c2, &c3);
-						if (n == 4)
-						{
-							printf("   phase %c-%02d: %4d,%4d,%4d,%4d\n", (phase >= 16) ? 'V' : 'H', phase % 16, c0, c1, c2, c3);
-							//printf("%03X: %03X %03X %03X %03X;\n",phase*4, c0 & 0x1FF, c1 & 0x1FF, c2 & 0x1FF, c3 & 0x1FF);
-
-							spi_w((c0 & 0x1FF) | (((phase * 4) + 0) << 9));
-							spi_w((c1 & 0x1FF) | (((phase * 4) + 1) << 9));
-							spi_w((c2 & 0x1FF) | (((phase * 4) + 2) << 9));
-							spi_w((c3 & 0x1FF) | (((phase * 4) + 3) << 9));
-
-							phase++;
-							if (phase >= 32) break;
-						}
-					}
-				}
-				DisableIO();
-			}
-
-			free(buf);
-		}
-	}
-}
-
-int user_io_get_scaler_flt()
-{
-	return new_scaler ? scaler_flt_cfg[0] : -1;
-}
-
-char* user_io_get_scaler_coeff()
-{
-	return scaler_flt_cfg + 1;
-}
-
-static char scaler_cfg[128] = { 0 };
-
-void user_io_set_scaler_flt(int n)
-{
-	scaler_flt_cfg[0] = (char)n;
-	FileSaveConfig(scaler_cfg, &scaler_flt_cfg, sizeof(scaler_flt_cfg));
-	spi_uio_cmd8(UIO_SET_FLTNUM, scaler_flt_cfg[0]);
-	spi_uio_cmd(UIO_SET_FLTCOEF);
-}
-
-void user_io_set_scaler_coeff(char *name)
-{
-	strcpy(scaler_flt_cfg + 1, name);
-	FileSaveConfig(scaler_cfg, &scaler_flt_cfg, sizeof(scaler_flt_cfg));
-	setScaler();
-	user_io_send_buttons(1);
-}
-
-static void loadScalerCfg()
-{
-	sprintf(scaler_cfg, "%s_scaler.cfg", user_io_get_core_name_ex());
-	if (!FileLoadConfig(scaler_cfg, &scaler_flt_cfg, sizeof(scaler_flt_cfg) - 1) || scaler_flt_cfg[0]>4)
-	{
-		memset(scaler_flt_cfg, 0, sizeof(scaler_flt_cfg));
-	}
-}
-
-static void setVideo(vmode_custom_t *v)
-{
-	loadScalerCfg();
-	setScaler();
-
-	printf("Send HDMI parameters:\n");
-	spi_uio_cmd_cont(UIO_SET_VIDEO);
-	printf("video: ");
-	for (int i = 1; i <= 8; i++)
-	{
-		v_cur.item[i] = v->item[i];
-		spi_w(v->item[i]);
-		printf("%d, ", v->item[i]);
-	}
-	printf("\nPLL: ");
-	for (int i = 9; i < 21; i++)
-	{
-		v_cur.item[i] = v->item[i];
-		printf("0x%X, ", v->item[i]);
-		if (i & 1) spi_w(v->item[i] | ((i == 9 && (is_menu_core() ? cfg.menu_pal : (cfg.vsync_adjust == 2))) ? 0x8000 : 0));
-		else
-		{
-			spi_w(v->item[i]);
-			spi_w(v->item[i] >> 16);
-		}
-	}
-
-	v_cur.Fpix = v->Fpix;
-	printf("Fpix=%f\n", v->Fpix);
-	DisableIO();
-}
-
-static int parse_custom_video_mode(char* vcfg, vmode_custom_t *v)
-{
-	int khz = 0;
-	int cnt = 0;
-	char *orig = vcfg;
-	while (*vcfg)
-	{
-		char *next;
-		if (cnt == 9 && v->item[0] == 1)
-		{
-			double Fpix = khz ? strtoul(vcfg, &next, 0)/1000.f : strtod(vcfg, &next);
-			if (vcfg == next || (Fpix < 2.f || Fpix > 300.f))
-			{
-				printf("Error parsing video_mode parameter: ""%s""\n", orig);
-				return -1;
-			}
-
-			setPLL(Fpix, v);
-			break;
-		}
-
-		uint32_t val = strtoul(vcfg, &next, 0);
-		if (vcfg == next || (*next != ',' && *next))
-		{
-			printf("Error parsing video_mode parameter: ""%s""\n", orig);
-			return -1;
-		}
-
-		if (!cnt && val >= 100)
-		{
-			v->item[cnt++] = 1;
-			khz = 1;
-		}
-		if (cnt < 32) v->item[cnt] = val;
-		if (*next == ',') next++;
-		vcfg = next;
-		cnt++;
-	}
-
-	if (cnt == 1)
-	{
-		printf("Set predefined video_mode to %d\n", v->item[0]);
-		return v->item[0];
-	}
-
-	if ((v->item[0] == 0 && cnt < 21) || (v->item[0] == 1 && cnt < 9))
-	{
-		printf("Incorrect amount of items in video_mode parameter: %d\n", cnt);
-		return -1;
-	}
-
-	if (v->item[0] > 1)
-	{
-		printf("Incorrect video_mode parameter\n");
-		return -1;
-	}
-
-	return -2;
-}
-
-static int store_custom_video_mode(char* vcfg, vmode_custom_t *v)
-{
-	int ret = parse_custom_video_mode(vcfg, v);
-	if (ret == -2) return 1;
-
-	uint mode = (ret < 0) ? 0 : ret;
-	if (mode >= VMODES_NUM) mode = 0;
-	for (int i = 0; i < 8; i++) v->item[i + 1] = vmodes[mode].vpar[i];
-	setPLL(vmodes[mode].Fpix, v);
-
-	return ret >= 0;
-}
-
-void parse_video_mode()
-{
-	vmode_def  = store_custom_video_mode(cfg.video_conf, &v_def);
-	vmode_pal  = store_custom_video_mode(cfg.video_conf_pal, &v_pal);
-	vmode_ntsc = store_custom_video_mode(cfg.video_conf_ntsc, &v_ntsc);
-	setVideo(&v_def);
-}
-
-static int adjust_video_mode(uint32_t vtime)
-{
-	printf("\033[1;33madjust_video_mode(%u): vsync_adjust=%d", vtime, cfg.vsync_adjust);
-
-	vmode_custom_t *v = &v_def;
-	if (vmode_pal && vmode_ntsc)
-	{
-		if (vtime > 1800000)
-		{
-			printf(", using PAL mode");
-			v = &v_pal;
-		}
-		else
-		{
-			printf(", using NTSC mode");
-			v = &v_ntsc;
-		}
-	}
-
-	printf(".\033[0m\n");
-
-	double Fpix = 100 * (v->item[1] + v->item[2] + v->item[3] + v->item[4]) * (v->item[5] + v->item[6] + v->item[7] + v->item[8]);
-	Fpix /= vtime;
-	if (Fpix < 2.f || Fpix > 300.f)
-	{
-		printf("Estimated Fpix(%.4f MHz) is outside supported range. Canceling auto-adjust.\n", Fpix);
-		return 0;
-	}
-
-	setPLL(Fpix, v);
-	setVideo(v);
-	user_io_send_buttons(1);
-	return 1;
-}
-
-typedef struct
-{
-	uint32_t mode;
-	uint32_t hpos;
-	uint32_t vpos;
-	uint32_t reserved;
-} vmode_adjust_t;
-
-vmode_adjust_t vmodes_adj[64] = {};
-
-static void adjust_vsize(char force)
-{
-	static uint16_t nres = 0;
-	spi_uio_cmd_cont(UIO_GET_VMODE);
-	uint16_t res = spi_w(0);
-	if ((res & 0x8000) && (nres != res || force))
-	{
-		nres = res;
-		uint16_t scr_hsize = spi_w(0);
-		uint16_t scr_vsize = spi_w(0);
-		DisableIO();
-
-		printf("\033[1;37mVMODE: resolution: %u x %u, mode: %u\033[0m\n", scr_hsize, scr_vsize, res & 255);
-
-		static int loaded = 0;
-		if (~loaded)
-		{
-			FileLoadConfig("minimig_vadjust.dat", vmodes_adj, sizeof(vmodes_adj));
-			loaded = 1;
-		}
-
-		uint32_t mode = scr_hsize | (scr_vsize << 12) | ((res & 0xFF) << 24);
-		if (mode)
-		{
-			for (uint i = 0; i < sizeof(vmodes_adj) / sizeof(vmodes_adj[0]); i++)
-			{
-				if (vmodes_adj[i].mode == mode)
-				{
-					spi_uio_cmd_cont(UIO_SET_VPOS);
-					spi_w(vmodes_adj[i].hpos >> 16);
-					spi_w(vmodes_adj[i].hpos);
-					spi_w(vmodes_adj[i].vpos >> 16);
-					spi_w(vmodes_adj[i].vpos);
-					printf("\033[1;37mVMODE: set positions: [%u-%u, %u-%u]\033[0m\n", vmodes_adj[i].hpos >> 16, (uint16_t)vmodes_adj[i].hpos, vmodes_adj[i].vpos >> 16, (uint16_t)vmodes_adj[i].vpos);
-					DisableIO();
-					return;
-				}
-			}
-			printf("\033[1;37mVMODE: preset not found.\033[0m\n");
-			spi_uio_cmd_cont(UIO_SET_VPOS); spi_w(0); spi_w(0); spi_w(0); spi_w(0);
-			DisableIO();
-		}
-	}
-	else
-	{
-		DisableIO();
-	}
-}
-
-static void store_vsize()
-{
-	Info("Stored");
-	minimig_adjust = 0;
-
-	spi_uio_cmd_cont(UIO_GET_VMODE);
-	uint16_t res = spi_w(0);
-	uint16_t scr_hsize = spi_w(0);
-	uint16_t scr_vsize = spi_w(0);
-	uint16_t scr_hbl_l = spi_w(0);
-	uint16_t scr_hbl_r = spi_w(0);
-	uint16_t scr_vbl_t = spi_w(0);
-	uint16_t scr_vbl_b = spi_w(0);
-	DisableIO();
-
-	printf("\033[1;37mVMODE: store position: [%u-%u, %u-%u]\033[0m\n", scr_hbl_l, scr_hbl_r, scr_vbl_t, scr_vbl_b);
-
-	uint32_t mode = scr_hsize | (scr_vsize << 12) | ((res & 0xFF) << 24);
-	if (mode)
-	{
-		int applied = 0;
-		int empty = -1;
-		for (int i = 0; (uint)i < sizeof(vmodes_adj) / sizeof(vmodes_adj[0]); i++)
-		{
-			if (vmodes_adj[i].mode == mode)
-			{
-				vmodes_adj[i].hpos = (scr_hbl_l << 16) | scr_hbl_r;
-				vmodes_adj[i].vpos = (scr_vbl_t << 16) | scr_vbl_b;
-				applied = 1;
-			}
-			if (empty < 0 && !vmodes_adj[i].mode) empty = i;
-		}
-
-		if (!applied && empty >= 0)
-		{
-			vmodes_adj[empty].mode = mode;
-			vmodes_adj[empty].hpos = (scr_hbl_l << 16) | scr_hbl_r;
-			vmodes_adj[empty].vpos = (scr_vbl_t << 16) | scr_vbl_b;
-			applied = 1;
-		}
-
-		if (applied)
-		{
-			FileSaveConfig("minimig_vadjust.dat", vmodes_adj, sizeof(vmodes_adj));
-		}
-	}
-}
-
-static int api1_5 = 0;
-static uint32_t show_video_info(int force)
-{
-	uint32_t ret = 0;
-	static uint8_t nres = 0;
-	spi_uio_cmd_cont(UIO_GET_VRES);
-	uint8_t res = spi_in();
-	if ((nres != res) || force)
-	{
-		nres = res;
-		uint32_t width = spi_w(0) | (spi_w(0) << 16);
-		uint32_t height = spi_w(0) | (spi_w(0) << 16);
-		uint32_t htime = spi_w(0) | (spi_w(0) << 16);
-		uint32_t vtime = spi_w(0) | (spi_w(0) << 16);
-		uint32_t ptime = spi_w(0) | (spi_w(0) << 16);
-		uint32_t vtimeh = spi_w(0) | (spi_w(0) << 16);
-		DisableIO();
-
-		float vrate = 100000000;
-		if (vtime) vrate /= vtime; else vrate = 0;
-		float hrate = 100000;
-		if (htime) hrate /= htime; else hrate = 0;
-
-		float prate = width * 100;
-		prate /= ptime;
-
-		printf("\033[1;33mINFO: Video resolution: %u x %u, fHorz = %.1fKHz, fVert = %.1fHz, fPix = %.2fMHz\033[0m\n", width, height, hrate, vrate, prate);
-		printf("\033[1;33mINFO: Frame time (100MHz counter): VGA = %d, HDMI = %d\033[0m\n", vtime, vtimeh);
-
-		if (vtimeh) api1_5 = 1;
-		if (hasAPI1_5() && cfg.video_info)
-		{
-			static char str[128];
-			float vrateh = 100000000;
-			if (vtimeh) vrateh /= vtimeh; else vrateh = 0;
-			sprintf(str, "%4dx%-4d %6.2fKHz %4.1fHz\n" \
-				         "\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\x81\n" \
-				         "%4dx%-4d %6.2fMHz %4.1fHz",
-				width, height, hrate, vrate, v_cur.item[1], v_cur.item[5], v_cur.Fpix, vrateh);
-			Info(str, cfg.video_info * 1000);
-		}
-
-		uint32_t scrh = v_cur.item[5];
-		if (height && scrh)
-		{
-			if (cfg.vscale_border)
-			{
-				uint32_t border = cfg.vscale_border * 2;
-				if ((border + 100) > scrh) border = scrh - 100;
-				scrh -= border;
-			}
-
-			if (cfg.vscale_mode)
-			{
-				uint32_t div = 1 << (cfg.vscale_mode - 1);
-				uint32_t mag = (scrh*div) / height;
-				scrh = (height * mag) / div;
-			}
-
-			if(cfg.vscale_border || cfg.vscale_mode)
-			{
-				printf("*** Set vertical scaling to : %d\n", scrh);
-				spi_uio_cmd16(UIO_SETHEIGHT, scrh);
-			}
-			else
-			{
-				spi_uio_cmd16(UIO_SETHEIGHT, 0);
-			}
-		}
-
-		if (vtime && vtimeh) ret = vtime;
-	}
-	else
-	{
-		DisableIO();
-	}
-
-	adjust_vsize(0);
-	return ret;
-}
-
-int hasAPI1_5()
-{
-	return api1_5;
 }

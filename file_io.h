@@ -21,11 +21,18 @@ typedef struct
 	char            name[261];
 }  fileTYPE;
 
+struct direntext_t
+{
+	dirent de;
+	int  cookie;
+	char altname[256];
+};
+
 int flist_nDirEntries();
 int flist_iFirstEntry();
 int flist_iSelectedEntry();
-dirent* flist_DirItem(int n);
-dirent* flist_SelectedItem();
+direntext_t* flist_DirItem(int n);
+direntext_t* flist_SelectedItem();
 
 // scanning flags
 #define SCANF_INIT       0 // start search from beginning of directory
@@ -41,6 +48,8 @@ dirent* flist_SelectedItem();
 #define SCANO_UMOUNT     2 // allow backspace key
 #define SCANO_CORES      4 // only include subdirectories with prefix '_'
 #define SCANO_COEFF      8
+#define SCANO_NEOGEO     16
+#define SCANO_NOENTER    32
 
 void FindStorage();
 int  getStorage(int from_setting);
@@ -61,10 +70,15 @@ int FileReadSec(fileTYPE *file, void *pBuffer);
 int FileWriteAdv(fileTYPE *file, void *pBuffer, int length);
 int FileWriteSec(fileTYPE *file, void *pBuffer);
 
+int FileExists(const char *name);
 int FileCanWrite(const char *name);
 
 #define SAVE_DIR "saves"
 void FileGenerateSavePath(const char *name, char* out_name);
+
+#define SCREENSHOT_DIR "screenshots"
+#define SCREENSHOT_DEFAULT "screen"
+void FileGenerateScreenshotName(const char *name, char *out_name, int buflen);
 
 int FileSave(const char *name, void *pBuffer, int size);
 int FileLoad(const char *name, void *pBuffer, int size); // supply pBuffer = 0 to get the file size without loading

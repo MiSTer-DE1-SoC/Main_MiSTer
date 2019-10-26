@@ -392,7 +392,7 @@ static void BootCustomInit()
 	mem_write16(0x000a);
 	mem_upload_fini();
 
-	//move.w #$0000,$dff088  ; COPJMP1, restart copper at location 1 
+	//move.w #$0000,$dff088  ; COPJMP1, restart copper at location 1
 	mem_upload_init(0xdff088);
 	mem_write16(0x0000);
 	mem_upload_fini();
@@ -445,7 +445,7 @@ void BootInit()
 	}
 
 	minimig_config.kickstart[0] = 0;
-	minimig_LoadCfg(0);
+	minimig_cfg_load(0);
 }
 
 void BootPrintEx(const char * str)

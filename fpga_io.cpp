@@ -9,8 +9,11 @@
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+
 #include "fpga_io.h"
 #include "file_io.h"
+#include "input.h"
+#include "osd.h"
 
 #include "fpga_base_addr_ac5.h"
 #include "fpga_manager.h"
@@ -132,7 +135,7 @@ static int fpgamgr_test_fpga_ready(void)
 }
 
 /*
-// Poll until FPGA is ready to be accessed or timeout occurred 
+// Poll until FPGA is ready to be accessed or timeout occurred
 static int fpgamgr_poll_fpga_ready(void)
 {
 	unsigned long i;
@@ -447,6 +450,7 @@ static int make_env(const char *name, const char *cfg)
 
 int fpga_load_rbf(const char *name, const char *cfg)
 {
+	OsdDisable();
 	static char path[1024];
 	int ret = 0;
 
@@ -458,7 +462,9 @@ int fpga_load_rbf(const char *name, const char *cfg)
 	}
 
 	printf("Loading RBF: %s\n", name);
-	sprintf(path, "%s/%s", !strcasecmp(name, "menu.rbf") ? getStorageDir(0) : getRootDir(), name);
+
+	if(name[0] == '/') strcpy(path, name);
+	else sprintf(path, "%s/%s", !strcasecmp(name, "menu.rbf") ? getStorageDir(0) : getRootDir(), name);
 
 	int rbf = open(path, O_RDONLY);
 	if (rbf < 0)
@@ -627,6 +633,9 @@ void app_restart(const char *path)
 {
 	sync();
 	fpga_core_reset(1);
+
+	input_switch(0);
+	input_uinp_destroy();
 
 	char *appname = getappname();
 	printf("restarting the %s\n", appname);

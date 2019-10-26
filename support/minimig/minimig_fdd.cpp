@@ -30,7 +30,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "minimig_fdd.h"
 #include "minimig_config.h"
 #include "../../debug.h"
-#include "../../fpga_io.h"
+#include "../../user_io.h"
 #include "../../menu.h"
 
 unsigned char drives = 0; // number of active drives reported by FPGA (may change only during reset)
@@ -159,7 +159,7 @@ void SendGap(void)
 
 // read a track from disk
 void ReadTrack(adfTYPE *drive)
-{ 
+{
 	// track number is updated in drive struct before calling this function
 
 	unsigned char sector;

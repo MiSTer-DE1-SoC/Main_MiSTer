@@ -70,9 +70,6 @@
     <ClCompile Include="sxmlc.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="tzx2wav.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="user_io.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -131,6 +128,21 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="charrom.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="cheats.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="lib\lodepng\lodepng.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="scaler.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="video.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="support\neogeo\loader.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -201,9 +213,6 @@
     <ClInclude Include="sxmlc.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="tzx2wav.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="user_io.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -265,6 +274,24 @@
       <Filter>Header Files\miniz</Filter>
     </ClInclude>
     <ClInclude Include="bootcore.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="cheats.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lib\lodepng\lodepng.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="scaler.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="video.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lib\imlib2\Imlib2.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="support\neogeo\loader.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

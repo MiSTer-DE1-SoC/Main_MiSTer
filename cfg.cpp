@@ -13,6 +13,7 @@ void MiSTer_ini_parse()
 {
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.bootscreen = 1;
+	cfg.fb_terminal = 1;
 	ini_parse(&ini_cfg);
 }
 
@@ -28,6 +29,7 @@ const ini_var_t ini_vars[] = {
 	{ "COMPOSITE_SYNC", (void*)(&(cfg.csync)), UINT8, 0, 1, 1 },
 	{ "FORCED_SCANDOUBLER", (void*)(&(cfg.forced_scandoubler)), UINT8, 0, 1, 1 },
 	{ "VGA_SCALER", (void*)(&(cfg.vga_scaler)), UINT8, 0, 1, 1 },
+	{ "VGA_SOG", (void*)(&(cfg.vga_sog)), UINT8, 0, 1, 1 },
 	{ "KEYRAH_MODE", (void*)(&(cfg.keyrah_mode)), UINT32, 0, (int)0xFFFFFFFF, 1 },
 	{ "RESET_COMBO", (void*)(&(cfg.reset_combo)), UINT8, 0, 3, 1 },
 	{ "KEY_MENU_AS_RGUI", (void*)(&(cfg.key_menu_as_rgui)), UINT8, 0, 1, 1 },
@@ -38,6 +40,7 @@ const ini_var_t ini_vars[] = {
 	{ "VSYNC_ADJUST", (void*)(&(cfg.vsync_adjust)), UINT8, 0, 2, 1 },
 	{ "HDMI_AUDIO_96K", (void*)(&(cfg.hdmi_audio_96k)), UINT8, 0, 1, 1 },
 	{ "DVI_MODE", (void*)(&(cfg.dvi)), UINT8, 0, 1, 1 },
+	{ "HDMI_LIMITED", (void*)(&(cfg.hdmi_limited)), UINT8, 0, 1, 1 },
 	{ "KBD_NOMOUSE", (void*)(&(cfg.kbd_nomouse)), UINT8, 0, 1, 1 },
 	{ "MOUSE_THROTTLE", (void*)(&(cfg.mouse_throttle)), UINT8, 1, 100, 1 },
 	{ "BOOTSCREEN", (void*)(&(cfg.bootscreen)), UINT8, 0, 1, 1 },
@@ -49,6 +52,9 @@ const ini_var_t ini_vars[] = {
 	{ "BOOTCORE", (void*)(&(cfg.bootcore)), STRING, 0, sizeof(cfg.bootcore) - 1, 1 },
 	{ "BOOTCORE_TIMEOUT", (void*)(&(cfg.bootcore_timeout)), INT16, 10, 30, 1 },
 	{ "FONT", (void*)(&(cfg.font)), STRING, 0, sizeof(cfg.font) - 1, 1 },
+	{ "FB_SIZE", (void*)(&(cfg.fb_size)), UINT8, 1, 4, 1 },
+	{ "FB_TERMINAL", (void*)(&(cfg.fb_terminal)), UINT8, 0, 1, 1 },
+	{ "OSD_TIMEOUT", (void*)(&(cfg.osd_timeout)), INT16, 5, 3600, 1 },
 };
 
 // mist ini config

@@ -30,7 +30,7 @@
     <NMakeOutput>MiSTer</NMakeOutput>
     <NMakeCleanCommandLine>git.lnk ./clean.sh</NMakeCleanCommandLine>
     <NMakePreprocessorDefinitions>__arm__;__GNUC__;__USE_GNU ;_GNU_SOURCE;VDATE="000000";_FILE_OFFSET_BITS=64;_LARGEFILE64_SOURCE;$(NMakePreprocessorDefinitions)</NMakePreprocessorDefinitions>
-    <NMakeIncludeSearchPath>c:\Work\Git\opt\gcc54\arm-linux-gnueabihf\libc\usr\include;c:\Work\Git\opt\gcc54\lib\gcc\arm-linux-gnueabihf\5.4.1\include;c:\Work\Git\opt\gcc54\arm-linux-gnueabihf\include\c++\5.4.1;$(NMakeIncludeSearchPath);lib\libco;lib\miniz</NMakeIncludeSearchPath>
+    <NMakeIncludeSearchPath>c:\Work\Git\opt\gcc54\arm-linux-gnueabihf\libc\usr\include;c:\Work\Git\opt\gcc54\lib\gcc\arm-linux-gnueabihf\5.4.1\include;c:\Work\Git\opt\gcc54\arm-linux-gnueabihf\include\c++\5.4.1;$(NMakeIncludeSearchPath);lib\libco;lib\miniz;lib\lodepng</NMakeIncludeSearchPath>
     <OutDir>$(TEMP)</OutDir>
     <IntDir>$(TEMP)</IntDir>
     <AdditionalOptions>
@@ -53,6 +53,7 @@
     <ClCompile Include="brightness.cpp" />
     <ClCompile Include="cfg.cpp" />
     <ClCompile Include="charrom.cpp" />
+    <ClCompile Include="cheats.cpp" />
     <ClCompile Include="DiskImage.cpp" />
     <ClCompile Include="file_io.cpp" />
     <ClCompile Include="fpga_io.cpp" />
@@ -61,6 +62,7 @@
     <ClCompile Include="input.cpp" />
     <ClCompile Include="lib\libco\arm.c" />
     <ClCompile Include="lib\libco\libco.c" />
+    <ClCompile Include="lib\lodepng\lodepng.cpp" />
     <ClCompile Include="lib\miniz\miniz.c" />
     <ClCompile Include="lib\miniz\miniz_tdef.c" />
     <ClCompile Include="lib\miniz\miniz_tinfl.c" />
@@ -68,6 +70,7 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="menu.cpp" />
     <ClCompile Include="osd.cpp" />
+    <ClCompile Include="scaler.cpp" />
     <ClCompile Include="scheduler.cpp" />
     <ClCompile Include="spi.cpp" />
     <ClCompile Include="support\archie\archie.cpp" />
@@ -75,14 +78,15 @@
     <ClCompile Include="support\minimig\minimig_config.cpp" />
     <ClCompile Include="support\minimig\minimig_fdd.cpp" />
     <ClCompile Include="support\minimig\minimig_hdd.cpp" />
+    <ClCompile Include="support\neogeo\loader.cpp" />
     <ClCompile Include="support\sharpmz\sharpmz.cpp" />
     <ClCompile Include="support\snes\snes.cpp" />
     <ClCompile Include="support\st\st_ikbd.cpp" />
     <ClCompile Include="support\st\st_tos.cpp" />
     <ClCompile Include="support\x86\x86.cpp" />
     <ClCompile Include="sxmlc.c" />
-    <ClCompile Include="tzx2wav.cpp" />
     <ClCompile Include="user_io.cpp" />
+    <ClCompile Include="video.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="battery.h" />
@@ -90,6 +94,7 @@
     <ClInclude Include="brightness.h" />
     <ClInclude Include="cfg.h" />
     <ClInclude Include="charrom.h" />
+    <ClInclude Include="cheats.h" />
     <ClInclude Include="debug.h" />
     <ClInclude Include="DiskImage.h" />
     <ClInclude Include="file_io.h" />
@@ -102,8 +107,10 @@
     <ClInclude Include="hardware.h" />
     <ClInclude Include="ini_parser.h" />
     <ClInclude Include="input.h" />
+    <ClInclude Include="lib\imlib2\Imlib2.h" />
     <ClInclude Include="lib\libco\libco.h" />
     <ClInclude Include="lib\libco\settings.h" />
+    <ClInclude Include="lib\lodepng\lodepng.h" />
     <ClInclude Include="lib\miniz\miniz.h" />
     <ClInclude Include="lib\miniz\miniz_common.h" />
     <ClInclude Include="lib\miniz\miniz_tdef.h" />
@@ -112,6 +119,7 @@
     <ClInclude Include="logo.h" />
     <ClInclude Include="menu.h" />
     <ClInclude Include="osd.h" />
+    <ClInclude Include="scaler.h" />
     <ClInclude Include="scheduler.h" />
     <ClInclude Include="spi.h" />
     <ClInclude Include="support.h" />
@@ -121,14 +129,15 @@
     <ClInclude Include="support\minimig\minimig_fdd.h" />
     <ClInclude Include="support\minimig\minimig_hdd.h" />
     <ClInclude Include="support\minimig\minimig_hdd_internal.h" />
+    <ClInclude Include="support\neogeo\loader.h" />
     <ClInclude Include="support\sharpmz\sharpmz.h" />
     <ClInclude Include="support\snes\snes.h" />
     <ClInclude Include="support\st\st_ikbd.h" />
     <ClInclude Include="support\st\st_tos.h" />
     <ClInclude Include="support\x86\x86.h" />
     <ClInclude Include="sxmlc.h" />
-    <ClInclude Include="tzx2wav.h" />
     <ClInclude Include="user_io.h" />
+    <ClInclude Include="video.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

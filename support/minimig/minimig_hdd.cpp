@@ -31,7 +31,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "../../menu.h"
 #include "minimig_config.h"
 #include "../../debug.h"
-#include "../../fpga_io.h"
+#include "../../user_io.h"
 
 #define CMD_IDECMD                 0x04
 #define CMD_IDEDAT                 0x08
@@ -319,7 +319,7 @@ static void IdentifyDevice(uint16_t *pBuffer, hdfTYPE *hdf)
 		}
 
 		p = (char*)&pBuffer[27];
-		for (i = 0; i < 40; i += 2) 
+		for (i = 0; i < 40; i += 2)
 		{
 			char c = p[i];
 			p[i] = p[i + 1];

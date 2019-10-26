@@ -84,6 +84,7 @@ static void SendFileV2(fileTYPE* file, unsigned char* key, int keysize, int addr
 	printf("]\n");
 }
 
+
 static char UploadKickstart(char *name)
 {
 	fileTYPE file = {};
@@ -115,6 +116,28 @@ static char UploadKickstart(char *name)
 			FileClose(&file);
 			return(1);
 		}
+		else if ((file.size == 8203) && keysize) {
+		        // Cloanto encrypted A1000 boot ROM
+		        BootPrint("Uploading encrypted A1000 boot ROM");
+			SendFileV2(&file, romkey, keysize, 0xf80000, file.size >> 9);
+			FileClose(&file);
+			//clear tag (write 0 to $fc0000) to force bootrom to load Kickstart from disk
+			//and not use one which was already there.
+			spi_osd_cmd32le_cont(OSD_CMD_WR, 0xfc0000);
+			spi8(0x00);spi8(0x00);
+			DisableOsd();
+			return(1);
+		  }
+		else if (file.size == 0x2000) {
+		        // 8KB A1000 boot ROM
+		        BootPrint("Uploading A1000 boot ROM");
+		        SendFileV2(&file, NULL, 0, 0xf80000, file.size >> 9);
+			FileClose(&file);
+			spi_osd_cmd32le_cont(OSD_CMD_WR, 0xfc0000);
+			spi8(0x00);spi8(0x00);
+			DisableOsd();
+			return(1);
+		  }
 		else if (file.size == 0x80000) {
 			// 512KB Kickstart ROM
 			BootPrint("Uploading 512KB Kickstart ...");
@@ -244,12 +267,12 @@ static char* GetConfigurationName(int num, int chk)
 	return name+strlen(CONFIG_DIR)+1;
 }
 
-int minimig_SaveCfg(int num)
+int minimig_cfg_save(int num)
 {
 	return FileSaveConfig(GetConfigurationName(num, 0), &minimig_config, sizeof(minimig_config));
 }
 
-const char* minimig_GetCfgInfo(int num)
+const char* minimig_get_cfg_info(int num)
 {
 	char *filename = GetConfigurationName(num, 1);
 	if (!filename) return NULL;
@@ -278,7 +301,7 @@ static void ApplyConfiguration(char reloadkickstart)
 	printf("CPU clock     : %s\n", minimig_config.chipset & 0x01 ? "turbo" : "normal");
 	printf("Chip RAM size : %s\n", config_memory_chip_msg[minimig_config.memory & 0x03]);
 	printf("Slow RAM size : %s\n", config_memory_slow_msg[minimig_config.memory >> 2 & 0x03]);
-	printf("Fast RAM size : %s\n", config_memory_fast_msg[minimig_config.memory >> 4 & 0x03]);
+	printf("Fast RAM size : %s\n", config_memory_fast_msg[((minimig_config.memory >> 4) & 0x03) | ((minimig_config.memory & 0x80) >> 5)]);
 
 	printf("Floppy drives : %u\n", minimig_config.floppy.drives + 1);
 	printf("Floppy speed  : %s\n", minimig_config.floppy.speed ? "fast" : "normal");
@@ -343,7 +366,7 @@ static void ApplyConfiguration(char reloadkickstart)
 	ConfigAutofire(minimig_config.autofire, 0xC);
 }
 
-int minimig_LoadCfg(int num)
+int minimig_cfg_load(int num)
 {
 	static const char config_id[] = "MNMGCFG0";
 	char updatekickstart = 0;
@@ -441,7 +464,7 @@ int minimig_LoadCfg(int num)
 	char cfg_str[256];
 	sprintf(cfg_str, "CPU: %s, Chipset: %s, ChipRAM: %s, FastRAM: %s, SlowRAM: %s",
 			config_cpu_msg[minimig_config.cpu & 0x03], config_chipset_msg[(minimig_config.chipset >> 2) & 7],
-			config_memory_chip_msg[(minimig_config.memory >> 0) & 0x03], config_memory_fast_msg[(minimig_config.memory >> 4) & 0x03], config_memory_slow_msg[(minimig_config.memory >> 2) & 0x03]
+			config_memory_chip_msg[(minimig_config.memory >> 0) & 0x03], config_memory_fast_msg[((minimig_config.memory >> 4) & 0x03) | ((minimig_config.memory & 0x80) >> 5)], config_memory_slow_msg[(minimig_config.memory >> 2) & 0x03]
 			);
 	BootPrintEx(cfg_str);
 
@@ -463,17 +486,141 @@ int minimig_LoadCfg(int num)
 	return(result);
 }
 
-void MinimigReset()
+void minimig_reset()
 {
 	ApplyConfiguration(0);
 	user_io_rtc_reset();
 }
 
-void SetKickstart(char *name)
+void minimig_set_kickstart(char *name)
 {
 	uint len = strlen(name);
 	if (len > (sizeof(minimig_config.kickstart) - 1)) len = sizeof(minimig_config.kickstart) - 1;
 	memcpy(minimig_config.kickstart, name, len);
 	minimig_config.kickstart[len] = 0;
 	force_reload_kickstart = 1;
+}
+
+static char minimig_adjust = 0;
+
+typedef struct
+{
+	uint32_t mode;
+	uint32_t hpos;
+	uint32_t vpos;
+	uint32_t reserved;
+} vmode_adjust_t;
+
+vmode_adjust_t vmodes_adj[64] = {};
+
+static void adjust_vsize(char force)
+{
+	static uint16_t nres = 0;
+	spi_uio_cmd_cont(UIO_GET_VMODE);
+	uint16_t res = spi_w(0);
+	if ((res & 0x8000) && (nres != res || force))
+	{
+		nres = res;
+		uint16_t scr_hsize = spi_w(0);
+		uint16_t scr_vsize = spi_w(0);
+		DisableIO();
+
+		printf("\033[1;37mVMODE: resolution: %u x %u, mode: %u\033[0m\n", scr_hsize, scr_vsize, res & 255);
+
+		static int loaded = 0;
+		if (~loaded)
+		{
+			FileLoadConfig("minimig_vadjust.dat", vmodes_adj, sizeof(vmodes_adj));
+			loaded = 1;
+		}
+
+		uint32_t mode = scr_hsize | (scr_vsize << 12) | ((res & 0xFF) << 24);
+		if (mode)
+		{
+			for (uint i = 0; i < sizeof(vmodes_adj) / sizeof(vmodes_adj[0]); i++)
+			{
+				if (vmodes_adj[i].mode == mode)
+				{
+					spi_uio_cmd_cont(UIO_SET_VPOS);
+					spi_w(vmodes_adj[i].hpos >> 16);
+					spi_w(vmodes_adj[i].hpos);
+					spi_w(vmodes_adj[i].vpos >> 16);
+					spi_w(vmodes_adj[i].vpos);
+					printf("\033[1;37mVMODE: set positions: [%u-%u, %u-%u]\033[0m\n", vmodes_adj[i].hpos >> 16, (uint16_t)vmodes_adj[i].hpos, vmodes_adj[i].vpos >> 16, (uint16_t)vmodes_adj[i].vpos);
+					DisableIO();
+					return;
+				}
+			}
+			printf("\033[1;37mVMODE: preset not found.\033[0m\n");
+			spi_uio_cmd_cont(UIO_SET_VPOS); spi_w(0); spi_w(0); spi_w(0); spi_w(0);
+			DisableIO();
+		}
+	}
+	else
+	{
+		DisableIO();
+	}
+}
+
+static void store_vsize()
+{
+	Info("Stored");
+	minimig_adjust = 0;
+
+	spi_uio_cmd_cont(UIO_GET_VMODE);
+	uint16_t res = spi_w(0);
+	uint16_t scr_hsize = spi_w(0);
+	uint16_t scr_vsize = spi_w(0);
+	uint16_t scr_hbl_l = spi_w(0);
+	uint16_t scr_hbl_r = spi_w(0);
+	uint16_t scr_vbl_t = spi_w(0);
+	uint16_t scr_vbl_b = spi_w(0);
+	DisableIO();
+
+	printf("\033[1;37mVMODE: store position: [%u-%u, %u-%u]\033[0m\n", scr_hbl_l, scr_hbl_r, scr_vbl_t, scr_vbl_b);
+
+	uint32_t mode = scr_hsize | (scr_vsize << 12) | ((res & 0xFF) << 24);
+	if (mode)
+	{
+		int applied = 0;
+		int empty = -1;
+		for (int i = 0; (uint)i < sizeof(vmodes_adj) / sizeof(vmodes_adj[0]); i++)
+		{
+			if (vmodes_adj[i].mode == mode)
+			{
+				vmodes_adj[i].hpos = (scr_hbl_l << 16) | scr_hbl_r;
+				vmodes_adj[i].vpos = (scr_vbl_t << 16) | scr_vbl_b;
+				applied = 1;
+			}
+			if (empty < 0 && !vmodes_adj[i].mode) empty = i;
+		}
+
+		if (!applied && empty >= 0)
+		{
+			vmodes_adj[empty].mode = mode;
+			vmodes_adj[empty].hpos = (scr_hbl_l << 16) | scr_hbl_r;
+			vmodes_adj[empty].vpos = (scr_vbl_t << 16) | scr_vbl_b;
+			applied = 1;
+		}
+
+		if (applied)
+		{
+			FileSaveConfig("minimig_vadjust.dat", vmodes_adj, sizeof(vmodes_adj));
+		}
+	}
+}
+
+// 0 - disable
+// 1 - enable
+// 2 - cancel
+void minimig_set_adjust(char n)
+{
+	if (minimig_adjust && !n) store_vsize();
+	minimig_adjust = (n == 1) ? 1 : 0;
+	if (n == 2) adjust_vsize(1);
+}
+
+char minimig_get_adjust()
+{
+	return minimig_adjust;
 }

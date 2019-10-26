@@ -37,9 +37,10 @@ void input_notify_mode();
 int input_poll(int getchar);
 int is_key_pressed(int key);
 
-void start_map_setting(int cnt);
+void start_map_setting(int cnt, int set = 0);
 int get_map_button();
 int get_map_type();
+int get_map_clear();
 void finish_map_setting(int dismiss);
 uint16_t get_map_vid();
 uint16_t get_map_pid();
@@ -50,5 +51,12 @@ uint32_t get_ps2_code(uint16_t key);
 uint32_t get_amiga_code(uint16_t key);
 uint32_t get_atari_code(uint16_t key);
 uint32_t get_archie_code(uint16_t key);
+
+int input_has_lightgun();
+void input_lightgun_cal(uint16_t *cal);
+
+void input_switch(int grab);
+int input_state();
+void input_uinp_destroy();
 
 #endif
