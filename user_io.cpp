@@ -9,8 +9,11 @@
 #include <ctype.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/mman.h>
 
 #include "lib/lodepng/lodepng.h"
+#include "md5.h"
+
 #include "hardware.h"
 #include "osd.h"
 #include "user_io.h"
@@ -46,6 +49,7 @@ static int emu_mode = EMU_NONE;
 
 // keep state over core type and its capabilities
 static unsigned char core_type = CORE_TYPE_UNKNOWN;
+static unsigned char dual_sdr = 0;
 
 static int fio_size = 0;
 static int io_ver = 0;
@@ -68,6 +72,8 @@ static char keyboard_leds = 0;
 static bool caps_status = 0;
 static bool num_status = 0;
 static bool scrl_status = 0;
+
+static uint16_t sdram_cfg = 0;
 
 typedef struct
 {
@@ -167,16 +173,6 @@ unsigned char user_io_core_type()
 	return core_type;
 }
 
-char is_minimig()
-{
-	return(core_type == CORE_TYPE_MINIMIG2);
-}
-
-char is_archie()
-{
-	return(core_type == CORE_TYPE_ARCHIE);
-}
-
 char is_sharpmz()
 {
 	return(core_type == CORE_TYPE_SHARPMZ);
@@ -196,19 +192,40 @@ char* user_io_create_config_name()
 }
 
 static char core_name[16 + 1];  // max 16 bytes for core name
+static char core_dir[1024];
+
+static char filepath_store[1024];
+
+char *user_io_make_filepath(const char *path, const char *filename)
+{
+	snprintf(filepath_store, 1024, "%s/%s", path, filename);
+
+	return filepath_store;
+}
+
+void user_io_set_core_name(const char *name)
+{
+	strncpy(core_name, name, 17);
+	strncpy(core_dir, name, 1024);
+	prefixGameDir(core_dir, 1024);
+
+	printf("Core name set to \"%s\"\n", core_name);
+}
 
 char *user_io_get_core_name()
 {
 	return core_name;
 }
 
+char *user_io_get_core_path(void)
+{
+	return core_dir;
+}
+
 const char *user_io_get_core_name_ex()
 {
 	switch (user_io_core_type())
 	{
-	case CORE_TYPE_MINIMIG2:
-		return "MINIMIG";
-
 	case CORE_TYPE_MIST:
 		return "ST";
 
@@ -267,6 +284,28 @@ char is_neogeo_core()
 	return (is_neogeo_type == 1);
 }
 
+static int is_minimig_type = 0;
+char is_minimig()
+{
+	if (!is_minimig_type) is_minimig_type = strcasecmp(core_name, "minimig") ? 2 : 1;
+	return (is_minimig_type == 1);
+}
+
+static int is_megacd_type = 0;
+char is_megacd_core()
+{
+	if (!is_megacd_type) is_megacd_type = strcasecmp(core_name, "MEGACD") ? 2 : 1;
+	return (is_megacd_type == 1);
+}
+
+static int is_archie_type = 0;
+char is_archie_core()
+{
+	if (core_type == CORE_TYPE_ARCHIE) return 1;
+	if (!is_archie_type) is_archie_type = strcasecmp(core_name, "ARCHIE") ? 2 : 1;
+	return (is_archie_type == 1);
+}
+
 static int is_no_type = 0;
 static int disable_osd = 0;
 char has_menu()
@@ -286,11 +325,15 @@ static void user_io_read_core_name()
 	is_cpc_type = 0;
 	is_zx81_type = 0;
 	is_neogeo_type = 0;
+	is_minimig_type = 0;
 	core_name[0] = 0;
 
 	// get core name
-	char *p = user_io_8bit_get_string(0);
+	char *p = user_io_get_confstr(0);
 	if (p && p[0]) strcpy(core_name, p);
+
+	strncpy(core_dir, !strcasecmp(p, "minimig") ? "Amiga" : core_name, 1024);
+	prefixGameDir(core_dir, 1024);
 
 	printf("Core name is \"%s\"\n", core_name);
 }
@@ -379,7 +422,7 @@ static void parse_config()
 	joy_force = 0;
 
 	do {
-		p = user_io_8bit_get_string(i);
+		p = user_io_get_confstr(i);
 		printf("get cfgstring %d = %s\n", i, p);
 		if (!i && p && p[0])
 		{
@@ -514,6 +557,11 @@ const char* get_rbf_name()
 	return p+1;
 }
 
+const char* get_rbf_path()
+{
+	return core_path;
+}
+
 void MakeFile(const char * filename, const char * data)
 {
         FILE * file;
@@ -557,24 +605,127 @@ void SetMidiLinkMode(int mode)
         }
 }
 
-void user_io_init(const char *path)
+uint16_t sdram_sz(int sz)
+{
+	int res = 0;
+
+	int fd;
+	if ((fd = open("/dev/mem", O_RDWR | O_SYNC)) == -1) return 0;
+
+	void* buf = mmap(0, 0x1000, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x1FFFF000);
+	if (buf == (void *)-1)
+	{
+		printf("Unable to mmap(/dev/mem)\n");
+		close(fd);
+		return 0;
+	}
+
+	volatile uint8_t* par = (volatile uint8_t*)buf;
+	par += 0xF00;
+	if (sz >= 0)
+	{
+		*par++ = 0x12;
+		*par++ = 0x57;
+		*par++ = (uint8_t)(sz>>8);
+		*par++ = (uint8_t)sz;
+	}
+	else
+	{
+		if ((par[0] == 0x12) && (par[1] == 0x57))
+		{
+			res = 0x8000 | (par[2]<<8) | par[3];
+			if(res & 0x4000) printf("*** Debug phase: %d\n", (res & 0x100) ? (res & 0xFF) : -(res & 0xFF));
+			else printf("*** Found SDRAM config: %d\n", res & 7);
+		}
+		else if(!is_menu_core())
+		{
+			printf("*** SDRAM config not found\n");
+		}
+	}
+
+	munmap(buf, 0x1000);
+	close(fd);
+	return res;
+}
+
+uint16_t altcfg(int alt)
+{
+	int res = 0;
+
+	int fd;
+	if ((fd = open("/dev/mem", O_RDWR | O_SYNC)) == -1) return 0;
+
+	void* buf = mmap(0, 0x1000, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x1FFFF000);
+	if (buf == (void *)-1)
+	{
+		printf("Unable to mmap(/dev/mem)\n");
+		close(fd);
+		return 0;
+	}
+
+	volatile uint8_t* par = (volatile uint8_t*)buf;
+	par += 0xF04;
+	if (alt >= 0)
+	{
+		*par++ = 0x34;
+		*par++ = 0x99;
+		*par++ = 0xBA;
+		*par++ = (uint8_t)alt;
+		printf("** altcfg(%d)\n", alt);
+	}
+	else
+	{
+		if ((par[0] == 0x34) && (par[1] == 0x99) && (par[2] == 0xBA))
+		{
+			res = par[3];
+			printf("** altcfg: got cfg %d\n", res);
+		}
+		else
+		{
+			printf("** altcfg: no cfg\n");
+		}
+	}
+
+	munmap(buf, 0x1000);
+	close(fd);
+	return res;
+}
+
+int user_io_is_dualsdr()
+{
+	return dual_sdr;
+}
+
+int user_io_get_width()
+{
+	return fio_size;
+}
+
+void user_io_init(const char *path, const char *xml)
 {
 	char *name;
 	static char mainpath[512];
 	core_name[0] = 0;
 	disable_osd = 0;
 
-	memset(sd_image, 0, sizeof(sd_image));
-	ikbd_init();
-	tos_config_init();
+	// we need to set the directory to where the XML file (MRA) is
+	// not the RBF. The RBF will be in arcade, which the user shouldn't
+	// browse
+	strcpy(core_path, xml ? xml : path);
 
-	strcpy(core_path, path);
+	memset(sd_image, 0, sizeof(sd_image));
+
 	core_type = (fpga_core_id() & 0xFF);
 	fio_size = fpga_get_fio_size();
 	io_ver = fpga_get_io_version();
 
+	if (core_type == CORE_TYPE_8BIT2)
+	{
+		dual_sdr = 1;
+		core_type = CORE_TYPE_8BIT;
+	}
+
 	if ((core_type != CORE_TYPE_DUMB) &&
-		(core_type != CORE_TYPE_MINIMIG2) &&
 		(core_type != CORE_TYPE_MIST) &&
 		(core_type != CORE_TYPE_ARCHIE) &&
 		(core_type != CORE_TYPE_8BIT) &&
@@ -588,12 +739,14 @@ void user_io_init(const char *path)
 	spi_init(core_type != CORE_TYPE_UNKNOWN);
 	OsdSetSize(8);
 
+	user_io_read_confstr();
 	if (core_type == CORE_TYPE_8BIT)
 	{
 		puts("Identified 8BIT core");
 
 		// set core name. This currently only sets a name for the 8 bit cores
 		user_io_read_core_name();
+		spi_uio_cmd16(UIO_SET_MEMSZ, sdram_sz(-1));
 
 		// send a reset
 		user_io_8bit_set_status(UIO_STATUS_RESET, UIO_STATUS_RESET);
@@ -623,19 +776,18 @@ void user_io_init(const char *path)
 		puts("Identified core without user interface");
 		break;
 
-	case CORE_TYPE_MINIMIG2:
-		puts("Identified Minimig V2 core");
-		BootInit();
-		break;
-
 	case CORE_TYPE_MIST:
 		puts("Identified MiST core");
+		ikbd_init();
+		tos_config_init();
 		tos_upload(NULL);
 		break;
 
 	case CORE_TYPE_ARCHIE:
 		puts("Identified Archimedes core");
+		spi_uio_cmd16(UIO_SET_MEMSZ, sdram_sz(-1));
 		send_rtc(1);
+		user_io_set_core_name("Archie");
 		archie_init();
 		user_io_read_core_name();
 		parse_config();
@@ -643,6 +795,7 @@ void user_io_init(const char *path)
 
     case CORE_TYPE_SHARPMZ:
 		puts("Identified Sharp MZ Series core");
+		user_io_set_core_name("sharpmz");
         sharpmz_init();
 		user_io_read_core_name();
 		parse_config();
@@ -656,27 +809,42 @@ void user_io_init(const char *path)
 			OsdCoreNameSet(user_io_get_core_name());
 
 			printf("Loading config %s\n", name);
-			unsigned long status = 0;
-			if (FileLoadConfig(name, &status, 4))
+			uint32_t status[2] = { 0, 0 };
+			if (FileLoadConfig(name, status, 8))
 			{
-				printf("Found config\n");
-				status &= ~UIO_STATUS_RESET;
-				user_io_8bit_set_status(status, 0xffffffff & ~UIO_STATUS_RESET);
+				printf("Found config: %08X-%08X\n", status[0], status[1]);
+				status[0] &= ~UIO_STATUS_RESET;
+				user_io_8bit_set_status(status[0], ~UIO_STATUS_RESET, 0);
+				user_io_8bit_set_status(status[1], 0xffffffff, 1);
 			}
 			parse_config();
 
 			if (is_menu_core())
 			{
 				user_io_8bit_set_status((cfg.menu_pal) ? 0x10 : 0, 0x10);
-				if (cfg.fb_terminal) video_menu_bg((status >> 1) & 7);
+				if (cfg.fb_terminal) video_menu_bg((status[0] >> 1) & 7);
 				else user_io_8bit_set_status(0, 0xE);
 			}
 			else
 			{
-				if (is_x86_core())
+				if (xml)
+				{
+					arcade_send_rom(xml);
+				}
+				else if (is_minimig())
+				{
+					puts("Identified Minimig V2 core");
+					BootInit();
+				}
+				else if (is_x86_core())
 				{
 					x86_config_load();
 					x86_init();
+				}
+				else if (is_archie_core())
+				{
+					puts("Identified Archimedes core");
+					archie_init();
 				}
 				else
 				{
@@ -687,13 +855,13 @@ void user_io_init(const char *path)
 							// check for multipart rom
 							for (char i = 0; i < 4; i++)
 							{
-								sprintf(mainpath, "%s/boot%i.rom", user_io_get_core_name(), i);
+								sprintf(mainpath, "%s/boot%i.rom", user_io_get_core_path(), i);
 								user_io_file_tx(mainpath, i << 6);
 							}
 						}
 
 						// legacy style of rom
-						sprintf(mainpath, "%s/boot.rom", user_io_get_core_name());
+						sprintf(mainpath, "%s/boot.rom", user_io_get_core_path());
 						if (!user_io_file_tx(mainpath))
 						{
 							strcpy(name + strlen(name) - 3, "ROM");
@@ -717,20 +885,20 @@ void user_io_init(const char *path)
 						for (int m = 0; m < 3; m++)
 						{
 							const char *model = !m ? "" : (m == 1) ? "0" : "1";
-							sprintf(mainpath, "%s/boot%s.eZZ", user_io_get_core_name(), model);
+							sprintf(mainpath, "%s/boot%s.eZZ", user_io_get_core_path(), model);
 							user_io_file_tx(mainpath, 0x40 * (m + 1), 0, 1);
-							sprintf(mainpath, "%s/boot%s.eZ0", user_io_get_core_name(), model);
+							sprintf(mainpath, "%s/boot%s.eZ0", user_io_get_core_path(), model);
 							user_io_file_tx(mainpath, 0x40 * (m + 1), 0, 1);
 							for (int i = 0; i < 256; i++)
 							{
-								sprintf(mainpath, "%s/boot%s.e%02X", user_io_get_core_name(), model, i);
+								sprintf(mainpath, "%s/boot%s.e%02X", user_io_get_core_path(), model, i);
 								user_io_file_tx(mainpath, 0x40 * (m + 1), 0, 1);
 							}
 						}
 					}
 
 					// check if vhd present
-					sprintf(mainpath, "%s/boot.vhd", user_io_get_core_name());
+					sprintf(mainpath, "%s/boot.vhd", user_io_get_core_path());
 					user_io_set_index(0);
 					if (!user_io_file_mount(mainpath))
 					{
@@ -751,6 +919,8 @@ void user_io_init(const char *path)
 		user_io_8bit_set_status(0, UIO_STATUS_RESET);
 		break;
 	}
+
+	OsdRotation((cfg.osd_rotate == 1) ? 3 : (cfg.osd_rotate == 2) ? 1 : 0);
 
 	spi_uio_cmd_cont(UIO_GETUARTFLG);
 	uart_mode = spi_w(0);
@@ -1038,18 +1208,35 @@ void user_io_set_index(unsigned char index)
 	DisableFpga();
 }
 
+void user_io_set_download(unsigned char enable)
+{
+	EnableFpga();
+	spi8(UIO_FILE_TX);
+	spi8(enable ? 0xff : 0x00);
+	DisableFpga();
+}
+
 int user_io_file_mount(char *name, unsigned char index, char pre)
 {
 	int writable = 0;
 	int ret = 0;
-	if (x2trd_ext_supp(name))
+
+	if (!strcasecmp(user_io_get_core_name_ex(), "apple-ii"))
 	{
-		ret = x2trd(name, sd_image+ index);
+		ret = dsk2nib(name, sd_image + index);
 	}
-	else
+
+	if (!ret)
 	{
-		writable = FileCanWrite(name);
-		ret = FileOpenEx(&sd_image[index], name, writable ? (O_RDWR | O_SYNC) : O_RDONLY);
+		if (x2trd_ext_supp(name))
+		{
+			ret = x2trd(name, sd_image + index);
+		}
+		else
+		{
+			writable = FileCanWrite(name);
+			ret = FileOpenEx(&sd_image[index], name, writable ? (O_RDWR | O_SYNC) : O_RDONLY);
+		}
 	}
 
 	buffer_lba[index] = ULLONG_MAX;
@@ -1374,21 +1561,9 @@ static void send_pcolchr(const char* name, unsigned char index, int type)
 
 		user_io_set_index(index);
 
-		EnableFpga();
-		spi8(UIO_FILE_TX);
-		spi8(0xff);
-		DisableFpga();
-
-		EnableFpga();
-		spi8(UIO_FILE_TX_DAT);
-		spi_write(col_attr, type ? 1024 : 1025, fio_size);
-		DisableFpga();
-
-		// signal end of transmission
-		EnableFpga();
-		spi8(UIO_FILE_TX);
-		spi8(0x00);
-		DisableFpga();
+		user_io_set_download(1);
+		user_io_file_tx_write(col_attr, type ? 1024 : 1025);
+		user_io_set_download(0);
 	}
 }
 
@@ -1410,15 +1585,49 @@ static void check_status_change()
 	if ((stchg & 0xF0) == 0xA0 && last_status_change != (stchg & 0xF))
 	{
 		last_status_change = (stchg & 0xF);
-		uint32_t st = spi32w(0);
+		uint32_t st0 = spi32w(0);
+		uint32_t st1 = spi32w(0);
 		DisableIO();
-		user_io_8bit_set_status(st, ~UIO_STATUS_RESET);
-		//printf("** new status from core: %08X\n", st);
+		user_io_8bit_set_status(st0, ~UIO_STATUS_RESET, 0);
+		user_io_8bit_set_status(st1, 0xFFFFFFFF, 1);
 	}
 	else
 	{
 		DisableIO();
 	}
+}
+
+static char pchar[] = { 0x8C, 0x8F, 0x7F };
+
+#define PROGRESS_CNT    28
+#define PROGRESS_CHARS  (sizeof(pchar)/sizeof(pchar[0]))
+#define PROGRESS_MAX    ((PROGRESS_CHARS*PROGRESS_CNT)-1)
+
+static void tx_progress(const char* name, unsigned int progress)
+{
+	static char progress_buf[128];
+	memset(progress_buf, 0, sizeof(progress_buf));
+
+	if (progress > PROGRESS_MAX) progress = PROGRESS_MAX;
+	char c = pchar[progress % PROGRESS_CHARS];
+	progress /= PROGRESS_CHARS;
+
+	char *buf = progress_buf;
+	sprintf(buf, "\n\n %.27s\n ", name);
+	buf += strlen(buf);
+
+	for (unsigned int i = 0; i <= progress; i++) buf[i] = (i < progress) ? 0x7F : c;
+	buf[PROGRESS_CNT] = 0;
+
+	InfoMessage(progress_buf, 2000, "Loading");
+}
+
+void user_io_file_tx_write(const uint8_t *addr, uint16_t len)
+{
+	EnableFpga();
+	spi8(UIO_FILE_TX_DAT);
+	spi_write(addr, len, fio_size);
+	DisableFpga();
 }
 
 int user_io_file_tx(const char* name, unsigned char index, char opensave, char mute, char composite)
@@ -1456,20 +1665,14 @@ int user_io_file_tx(const char* name, unsigned char index, char opensave, char m
 	DisableFpga();
 
 	// prepare transmission of new file
-	EnableFpga();
-	spi8(UIO_FILE_TX);
-	spi8(0xff);
-	DisableFpga();
+	user_io_set_download(1);
 
 	if (is_snes_core() && bytes2send)
 	{
 		printf("Load SNES ROM.\n");
 		uint8_t* buf = snes_get_header(&f);
 		hexdump(buf, 16, 0);
-		EnableFpga();
-		spi8(UIO_FILE_TX_DAT);
-		spi_write(buf, 512, fio_size);
-		DisableFpga();
+		user_io_file_tx_write(buf, 512);
 
 		//strip original SNES ROM header if present (not used)
 		if (bytes2send & 512)
@@ -1482,19 +1685,51 @@ int user_io_file_tx(const char* name, unsigned char index, char opensave, char m
 	file_crc = 0;
 	uint32_t skip = bytes2send & 0x3FF; // skip possible header up to 1023 bytes
 
-	while (bytes2send)
-	{
-		printf(".");
+	int use_progress = 1; // (bytes2send > (1024 * 1024)) ? 1 : 0;
+	int size = bytes2send;
+	int progress = -1;
+	if (use_progress) MenuHide();
 
+	int dosend = 1;
+	if (!strcasecmp(core_name, "GBA") && ((index >> 6) == 1 || (index >> 6) == 2))
+	{
+		fileTYPE fg = {};
+		if (!FileOpen(&fg, user_io_make_filepath(HomeDir, "goomba.rom")))
+		{
+			dosend = 0;
+			Info("Cannot open goomba.rom!");
+			sleep(1);
+		}
+		else
+		{
+			uint32_t sz = fg.size;
+			while (sz)
+			{
+				uint16_t chunk = (sz > sizeof(buf)) ? sizeof(buf) : sz;
+				FileReadAdv(&fg, buf, chunk);
+				user_io_file_tx_write(buf, chunk);
+				sz -= chunk;
+			}
+			FileClose(&fg);
+		}
+	}
+
+	while (dosend && bytes2send)
+	{
 		uint16_t chunk = (bytes2send > sizeof(buf)) ? sizeof(buf) : bytes2send;
 
 		FileReadAdv(&f, buf, chunk);
+		user_io_file_tx_write(buf, chunk);
 
-		EnableFpga();
-		spi8(UIO_FILE_TX_DAT);
-		spi_write(buf, chunk, fio_size);
-		DisableFpga();
-
+		if (use_progress)
+		{
+			int new_progress = PROGRESS_MAX - ((((uint64_t)bytes2send)*PROGRESS_MAX) / size);
+			if (progress != new_progress)
+			{
+				progress = new_progress;
+				tx_progress(f.name, progress);
+			}
+		}
 		bytes2send -= chunk;
 
 		if (skip >= chunk) skip -= chunk;
@@ -1508,7 +1743,7 @@ int user_io_file_tx(const char* name, unsigned char index, char opensave, char m
 	// check if core requests some change while downloading
 	check_status_change();
 
-	printf("\n");
+	printf("Done.\n");
 	printf("CRC32: %08X\n", file_crc);
 
 	FileClose(&f);
@@ -1520,10 +1755,7 @@ int user_io_file_tx(const char* name, unsigned char index, char opensave, char m
 	}
 
 	// signal end of transmission
-	EnableFpga();
-	spi8(UIO_FILE_TX);
-	spi8(0x00);
-	DisableFpga();
+	user_io_set_download(0);
 	printf("\n");
 
 	if (is_zx81_core() && index)
@@ -1534,71 +1766,82 @@ int user_io_file_tx(const char* name, unsigned char index, char opensave, char m
 	return 1;
 }
 
-// 8 bit cores have a config string telling the firmware how
-// to treat it
-char *user_io_8bit_get_string(char index)
+static char cfgstr[1024 * 10] = {};
+void user_io_read_confstr()
+{
+	spi_uio_cmd_cont(UIO_GET_STRING);
+
+	uint32_t j = 0;
+	while (j < sizeof(cfgstr) - 1)
+	{
+		char i = spi_in();
+		if (!i) break;
+		cfgstr[j++] = i;
+	}
+
+	cfgstr[j++] = 0;
+	DisableIO();
+}
+
+char *user_io_get_confstr(int index)
 {
 	unsigned char i, lidx = 0, j = 0;
 	static char buffer[128 + 1];  // max 128 bytes per config item
-
 								  // clear buffer
 	buffer[0] = 0;
+	int pos = 0;
 
-	spi_uio_cmd_cont(UIO_GET_STRING);
-	i = spi_in();
-	// the first char returned will be 0xff if the core doesn't support
-	// config strings. atari 800 returns 0xa4 which is the status byte
-	if ((i == 0xff) || (i == 0xa4))
+	i = cfgstr[pos++];
+	while (i && (j < sizeof(buffer)))
 	{
-		DisableIO();
-		return NULL;
-	}
-
-	//  printf("String: ");
-	while ((i != 0) && (i != 0xff) && (j<sizeof(buffer)))
-	{
-		if (i == ';') {
+		if (i == ';')
+		{
 			if (lidx == index) buffer[j++] = 0;
 			lidx++;
 		}
-		else {
-			if (lidx == index)
-				buffer[j++] = i;
+		else
+		{
+			if (lidx == index) buffer[j++] = i;
 		}
 
-		//  printf("%c", i);
-		i = spi_in();
+		i = cfgstr[pos++];
 	}
-
-	DisableIO();
-	//  printf("\n");
 
 	// if this was the last string in the config string list, then it still
 	// needs to be terminated
 	if (lidx == index) buffer[j] = 0;
 
 	// also return NULL for empty strings
-	if (!buffer[0]) return NULL;
-
-	return buffer;
+	return buffer[0] ? buffer : NULL;
 }
 
-uint32_t user_io_8bit_set_status(uint32_t new_status, uint32_t mask)
+uint32_t user_io_8bit_set_status(uint32_t new_status, uint32_t mask, int ex)
 {
-	static uint32_t status = 0;
+	static uint32_t status[2] = { 0, 0 };
+	if (ex) ex = 1;
 
 	// if mask is 0 just return the current status
 	if (mask) {
 		// keep everything not masked
-		status &= ~mask;
+		status[ex] &= ~mask;
 		// updated masked bits
-		status |= new_status & mask;
+		status[ex] |= new_status & mask;
 
-		if(!io_ver)	spi_uio_cmd8(UIO_SET_STATUS, status);
-		spi_uio_cmd32(UIO_SET_STATUS2, status, io_ver);
+		if (!io_ver)
+		{
+			spi_uio_cmd8(UIO_SET_STATUS, status[0]);
+			spi_uio_cmd32(UIO_SET_STATUS2, status[0], 0);
+		}
+		else
+		{
+			spi_uio_cmd_cont(UIO_SET_STATUS2);
+			spi32w(status[0]);
+			spi32w(status[1]);
+			DisableIO();
+		}
 	}
 
-	return status;
+	return status[ex];
 }
 
 static char cur_btn = 0;
@@ -1631,19 +1874,37 @@ void user_io_send_buttons(char force)
 	if (cfg.forced_scandoubler) map |= CONF_FORCED_SCANDOUBLER;
 	if (cfg.hdmi_audio_96k) map |= CONF_AUDIO_96K;
 	if (cfg.dvi) map |= CONF_DVI;
-	if (cfg.hdmi_limited) map |= CONF_HDMI_LIMITED;
+	if (cfg.hdmi_limited & 1) map |= CONF_HDMI_LIMITED1;
+	if (cfg.hdmi_limited & 2) map |= CONF_HDMI_LIMITED2;
+	if (cfg.direct_video) map |= CONF_DIRECT_VIDEO;
 
 	if ((map != key_map) || force)
 	{
-		if (is_archie() && (key_map & BUTTON2) && !(map & BUTTON2))
+		if ((key_map & (BUTTON1 | BUTTON2)) == BUTTON2 && (map & (BUTTON1 | BUTTON2)) == (BUTTON1 | BUTTON2) && is_menu_core())
 		{
-			const char *name = get_rbf_name();
-			fpga_load_rbf(name[0] ? name : "Archie.rbf");
+			if (FileExists(ini_cfg.filename_alt))
+			{
+				altcfg(altcfg() ? 0 : 1);
+				fpga_load_rbf("menu.rbf");
+			}
 		}
 
-		if (is_minimig() && (key_map & BUTTON2) && !(map & BUTTON2))
+		const char *name = get_rbf_path();
+		if (name[0] && (get_key_mod() & (LGUI | LSHIFT)) == (LGUI | LSHIFT) && (key_map & BUTTON2) && !(map & BUTTON2))
 		{
-			minimig_reset();
+			uint16_t sz = sdram_sz(-1);
+			if (sz & 0x4000) sz++;
+			else sz = 0x4000;
+			sdram_sz(sz);
+			fpga_load_rbf(name);
+		}
+
+		//special reset for some cores
+		if ((key_map & BUTTON2) && !(map & BUTTON2))
+		{
+			if (is_archie_core()) fpga_load_rbf(name[0] ? name : "Archie.rbf");
+			if (is_minimig()) minimig_reset();
+			if (is_megacd_core()) mcd_reset();
 		}
 
 		key_map = map;
@@ -1701,8 +1962,8 @@ int cue_pt = 0;
 char cue_getch()
 {
 	static uint8_t buf[512];
-	if (!(cue_pt & 0x1ff)) FileReadSec(&sd_image[1], buf);
-	if (cue_pt >= sd_image[1].size) return 0;
+	if (!(cue_pt & 0x1ff)) FileReadSec(&sd_image[2], buf);
+	if (cue_pt >= sd_image[2].size) return 0;
 	return buf[(cue_pt++) & 0x1ff];
 }
 
@@ -1907,8 +2168,7 @@ void cd_generate_toc(uint16_t req_type, uint8_t *buffer)
 
 void user_io_poll()
 {
-	if ((core_type != CORE_TYPE_MINIMIG2) &&
-		(core_type != CORE_TYPE_MIST) &&
+	if ((core_type != CORE_TYPE_MIST) &&
 		(core_type != CORE_TYPE_ARCHIE) &&
 		(core_type != CORE_TYPE_SHARPMZ) &&
 		(core_type != CORE_TYPE_8BIT))
@@ -1936,7 +2196,7 @@ void user_io_poll()
 
 	user_io_send_buttons(0);
 
-	if (core_type == CORE_TYPE_MINIMIG2)
+	if (is_minimig())
 	{
 		//HDD & FDD query
 		unsigned char  c1, c2;
@@ -2064,7 +2324,7 @@ void user_io_poll()
 	{
 		x86_poll();
 	}
-	else if ((core_type == CORE_TYPE_8BIT || core_type == CORE_TYPE_ARCHIE) && !is_menu_core())
+	else if ((core_type == CORE_TYPE_8BIT || core_type == CORE_TYPE_ARCHIE) && !is_menu_core() && !is_minimig())
 	{
 		static uint8_t buffer[4][512];
 		uint32_t lba;
@@ -2158,7 +2418,7 @@ void user_io_poll()
 				//printf("SD RD %d on %d, WIDE=%d\n", lba, disk, fio_size);
 
 				int done = 0;
-				if (is_neogeo_core())
+				if (disk && is_neogeo_core())
 				{
 					uint32_t offset = 0;
 
@@ -2296,7 +2556,24 @@ void user_io_poll()
 
 						//Even after error we have to provide the block to the core
 						//Give an empty block.
-						if (!done) memset(buffer[disk], 0, sizeof(buffer[disk]));
+						if (!done)
+						{
+							if (sd_image[disk].type == 2)
+							{
+								if (is_megacd_core())
+								{
+									mcd_fill_blanksave(buffer[disk], lba);
+								}
+								else
+								{
+									memset(buffer[disk], -1, sizeof(buffer[disk]));
+								}
+							}
+							else
+							{
+								memset(buffer[disk], 0, sizeof(buffer[disk]));
+							}
+						}
 						buffer_lba[disk] = lba;
 					}
 
@@ -2335,7 +2612,7 @@ void user_io_poll()
 		}
 	}
 
-	if (core_type == CORE_TYPE_8BIT && !is_menu_core())
+	if (core_type == CORE_TYPE_8BIT && !is_menu_core() && !is_minimig() && !is_archie_core())
 	{
 		// frequently check ps2 mouse for events
 		if (CheckTimer(mouse_timer))
@@ -2423,11 +2700,11 @@ void user_io_poll()
 		send_rtc(1);
 	}
 
-	if (core_type == CORE_TYPE_ARCHIE) archie_poll();
+	if (core_type == CORE_TYPE_ARCHIE || is_archie_core()) archie_poll();
 	if (core_type == CORE_TYPE_SHARPMZ) sharpmz_poll();
 
 	static uint8_t leds = 0;
-	if(use_ps2ctl && core_type != CORE_TYPE_MINIMIG2)
+	if(use_ps2ctl && !is_minimig() && !is_archie_core())
 	{
 		leds |= (KBD_LED_FLAG_STATUS | KBD_LED_CAPS_CONTROL);
 
@@ -2589,6 +2866,37 @@ void user_io_poll()
 	}
 	else if(CheckTimer(res_timer))
 	{
+		if (is_menu_core())
+		{
+			static int got_cfg = 0;
+			if (!got_cfg)
+			{
+				spi_uio_cmd_cont(UIO_GET_OSDMASK);
+				sdram_cfg = spi_w(0);
+				DisableIO();
+
+				if (sdram_cfg & 0x8000)
+				{
+					got_cfg = 1;
+					printf("*** Got SDRAM module type: %d\n", sdram_cfg & 7);
+					switch (user_io_get_sdram_cfg() & 7)
+					{
+					case 7:
+						sdram_sz(3);
+						break;
+					case 3:
+						sdram_sz(2);
+						break;
+					case 1:
+						sdram_sz(1);
+						break;
+					default:
+						sdram_sz(0);
+					}
+				}
+			}
+		}
+
 		res_timer = GetTimer(500);
 		if (!minimig_get_adjust())
 		{
@@ -2625,11 +2933,13 @@ void user_io_poll()
 		fpga_set_led(0);
 		diskled_is_on = 0;
 	}
+
+	if (is_megacd_core()) mcd_poll();
 }
 
 static void send_keycode(unsigned short key, int press)
 {
-	if (core_type == CORE_TYPE_MINIMIG2)
+	if (is_minimig())
 	{
 		if (press > 1) return;
 
@@ -2698,6 +3008,41 @@ static void send_keycode(unsigned short key, int press)
 		// atari has "break" marker in msb
 		if (!press) code = (code & 0xff) | 0x80;
 		ikbd_keyboard(code);
+		return;
+	}
+
+	if (core_type == CORE_TYPE_ARCHIE || is_archie_core())
+	{
+		if (press > 1) return;
+
+		uint32_t code = get_archie_code(key);
+		if (code == NONE) return;
+
+		//WIN+...
+		if (get_key_mod() & (RGUI | LGUI))
+		{
+			switch (code)
+			{
+			case 0x00: code = 0xf;  //ESC = BRAKE
+				break;
+
+			case 0x11: code = 0x73; // 1 = Mouse extra 1
+				break;
+
+			case 0x12: code = 0x74; // 2 = Mouse extra 2
+				break;
+
+			case 0x13: code = 0x25; // 3 = KP#
+				break;
+			}
+		}
+
+		if (code == 0 && (get_key_mod() & (RGUI | LGUI)))
+		{
+			code = 0xF;
+		}
+		if (!press) code |= 0x8000;
+		archie_kbd(code);
 		return;
 	}
 
@@ -2773,40 +3118,6 @@ static void send_keycode(unsigned short key, int press)
 		}
 	}
 
-	if (core_type == CORE_TYPE_ARCHIE)
-	{
-		if (press > 1) return;
-
-		uint32_t code = get_archie_code(key);
-		if (code == NONE) return;
-
-		//WIN+...
-		if (get_key_mod() & (RGUI | LGUI))
-		{
-			switch(code)
-			{
-				case 0x00: code = 0xf;  //ESC = BRAKE
-					break;
-
-				case 0x11: code = 0x73; // 1 = Mouse extra 1
-					break;
-
-				case 0x12: code = 0x74; // 2 = Mouse extra 2
-					break;
-
-				case 0x13: code = 0x25; // 3 = KP#
-					break;
-			}
-		}
-
-		if (code == 0 && (get_key_mod() & (RGUI | LGUI)))
-		{
-			code = 0xF;
-		}
-		if (!press) code |= 0x8000;
-		archie_kbd(code);
-	}
-
 	if (core_type == CORE_TYPE_SHARPMZ)
 	{
 		uint32_t code = get_ps2_code(key);
@@ -2835,17 +3146,24 @@ void user_io_mouse(unsigned char b, int16_t x, int16_t y, int16_t w)
 {
 	switch (core_type)
 	{
-	case CORE_TYPE_MINIMIG2:
-		mouse_pos[X] += x;
-		mouse_pos[Y] += y;
-		mouse_flags |= 0x80 | (b & 7);
-		return;
-
 	case CORE_TYPE_8BIT:
-		mouse_pos[X] += x;
-		mouse_pos[Y] -= y;  // ps2 y axis is reversed over usb
-		mouse_wheel += w;
-		mouse_flags |= 0x08 | (b & 7);
+		if (is_minimig())
+		{
+			mouse_pos[X] += x;
+			mouse_pos[Y] += y;
+			mouse_flags |= 0x80 | (b & 7);
+		}
+		else if (is_archie_core())
+		{
+			archie_mouse(b, x, y);
+		}
+		else
+		{
+			mouse_pos[X] += x;
+			mouse_pos[Y] -= y;  // ps2 y axis is reversed over usb
+			mouse_wheel += w;
+			mouse_flags |= 0x08 | (b & 7);
+		}
 		return;
 
 	case CORE_TYPE_MIST:
@@ -2887,13 +3205,10 @@ void user_io_check_reset(unsigned short modifiers, char useKeys)
 		else
 		switch (core_type)
 		{
-		case CORE_TYPE_MINIMIG2:
-			minimig_reset();
-			break;
-
 		case CORE_TYPE_ARCHIE:
 		case CORE_TYPE_8BIT:
-			kbd_reset = 1;
+			if(is_minimig()) minimig_reset();
+			else kbd_reset = 1;
 			break;
 		}
 	}
@@ -3034,14 +3349,14 @@ void user_io_kbd(uint16_t key, int press)
 			{
 				if (is_menu_core() && !video_fb_state()) printf("PS2 code(make)%s for core: %d(0x%X)\n", (code & EXT) ? "(ext)" : "", code & 255, code & 255);
 				if (!osd_is_visible && !is_menu_core() && key == KEY_MENU && press == 3) open_joystick_setup();
-				else if ((has_menu() || osd_is_visible || (get_key_mod() & (LALT | RALT | RGUI | LGUI))) && (((key == KEY_F12) && ((!is_x86_core() && !is_archie()) || (get_key_mod() & (RGUI | LGUI)))) || key == KEY_MENU)) menu_key_set(KEY_F12);
+				else if ((has_menu() || osd_is_visible || (get_key_mod() & (LALT | RALT | RGUI | LGUI))) && (((key == KEY_F12) && ((!is_x86_core() && !is_archie_core()) || (get_key_mod() & (RGUI | LGUI)))) || key == KEY_MENU)) menu_key_set(KEY_F12);
 				else if (osd_is_visible)
 				{
 					if (press == 1) menu_key_set(key);
 				}
 				else
 				{
-					if (((code & EMU_SWITCH_1) || ((code & EMU_SWITCH_2) && !use_ps2ctl && !is_archie())) && !is_menu_core())
+					if (((code & EMU_SWITCH_1) || ((code & EMU_SWITCH_2) && !use_ps2ctl && !is_archie_core())) && !is_menu_core())
 					{
 						if (press == 1)
 						{
@@ -3132,4 +3447,9 @@ unsigned char user_io_ext_idx(char *name, char* ext)
 
 	printf("not found! use 0\n");
 	return 0;
+}
+
+uint16_t user_io_get_sdram_cfg()
+{
+	return sdram_cfg;
 }

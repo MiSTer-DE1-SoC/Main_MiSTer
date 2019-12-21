@@ -24,6 +24,7 @@ typedef struct {
 	uint8_t hdmi_audio_96k;
 	uint8_t dvi;
 	uint8_t hdmi_limited;
+	uint8_t direct_video;
 	uint8_t video_info;
 	uint8_t vsync_adjust;
 	uint8_t kbd_nomouse;
@@ -31,13 +32,15 @@ typedef struct {
 	uint8_t bootscreen;
 	uint8_t volumectl;
 	uint8_t vscale_mode;
-	uint8_t vscale_border;
+	uint16_t vscale_border;
 	uint8_t rbf_hide_datecode;
 	uint8_t menu_pal;
 	int16_t bootcore_timeout;
 	uint8_t fb_size;
 	uint8_t fb_terminal;
+	uint8_t osd_rotate;
 	uint16_t osd_timeout;
+	uint8_t gamepad_defaults;
 	char bootcore[256];
 	char video_conf[1024];
 	char video_conf_pal[1024];

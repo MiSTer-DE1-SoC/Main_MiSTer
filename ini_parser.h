@@ -27,7 +27,6 @@ typedef struct {
 	ini_vartypes_t type;
 	int min;
 	int max;
-	int section_id;
 } ini_var_t;
 
 typedef struct {
@@ -41,7 +40,7 @@ typedef struct {
 
 
 //// functions ////
-void ini_parse(const ini_cfg_t* cfg);
+void ini_parse(const ini_cfg_t* cfg, int alt);
 
 #endif // __INI_PARSER_H__
 

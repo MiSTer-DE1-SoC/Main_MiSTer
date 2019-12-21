@@ -42,6 +42,21 @@ static int iFirstEntry = 0;
 
 static char full_path[2100];
 
+fileTYPE::fileTYPE()
+{
+	filp = 0;
+	mode = 0;
+	type = 0;
+	zip = 0;
+	size = 0;
+	offset = 0;
+}
+
+int fileTYPE::opened()
+{
+	return filp || zip;
+}
+
 struct fileZipArchive
 {
 	mz_zip_archive                    archive;
@@ -142,8 +157,8 @@ static bool isPathDirectory(char *path)
 
 	return false;
 }
-/*
-static bool isPathRegularFile(char *path)
+
+static bool isPathRegularFile(const char *path)
 {
 	make_fullpath(path);
 
@@ -153,8 +168,8 @@ static bool isPathRegularFile(char *path)
 		mz_zip_archive z{};
 		if (!mz_zip_reader_init_file(&z, zip_path, 0))
 		{
-			printf("isPathRegularFile(mz_zip_reader_init_file) Zip:%s, error:%s\n", zip_path,
-			       mz_zip_get_error_string(mz_zip_get_last_error(&z)));
+			//printf("isPathRegularFile(mz_zip_reader_init_file) Zip:%s, error:%s\n", zip_path,
+			//       mz_zip_get_error_string(mz_zip_get_last_error(&z)));
 			return false;
 		}
 
@@ -167,9 +182,9 @@ static bool isPathRegularFile(char *path)
 		const int file_index = mz_zip_reader_locate_file(&z, file_path, NULL, 0);
 		if (file_index < 0)
 		{
-			printf("isPathRegularFile(mz_zip_reader_locate_file) Zip:%s, file:%s, error: %s\n",
-					 zip_path, file_path,
-					 mz_zip_get_error_string(mz_zip_get_last_error(&z)));
+			//printf("isPathRegularFile(mz_zip_reader_locate_file) Zip:%s, file:%s, error: %s\n",
+			//		 zip_path, file_path,
+			//		 mz_zip_get_error_string(mz_zip_get_last_error(&z)));
 			mz_zip_reader_end(&z);
 			return false;
 		}
@@ -183,19 +198,12 @@ static bool isPathRegularFile(char *path)
 	}
 	else
 	{
-		int stmode = get_stmode(full_path);
-		if (!stmode)
-		{
-			printf("isPathRegularFile(stat) path:%s, error:%s.\n", full_path, strerror(errno));
-			return false;
-		}
-
-		if (stmode & S_IFREG) return true;
+		if (get_stmode(full_path) & S_IFREG) return true;
 	}
 
 	return false;
 }
-*/
+
 void FileClose(fileTYPE *file)
 {
 	if (file->zip)
@@ -207,7 +215,6 @@ void FileClose(fileTYPE *file)
 		mz_zip_reader_end(&file->zip->archive);
 
 		delete file->zip;
-		file->zip = nullptr;
 	}
 
 	if (file->filp)
@@ -223,13 +230,14 @@ void FileClose(fileTYPE *file)
 			file->type = 0;
 		}
 	}
+
+	file->zip = nullptr;
 	file->filp = nullptr;
 }
 
 int FileOpenEx(fileTYPE *file, const char *name, int mode, char mute)
 {
 	make_fullpath((char*)name, mode);
-
 	FileClose(file);
 	file->mode = 0;
 	file->type = 0;
@@ -471,7 +479,7 @@ int FileReadAdv(fileTYPE *file, void *pBuffer, int length)
 	else
 	{
 		printf("FileReadAdv error(unknown file type).\n");
-		return -1;
+		return 0;
 	}
 
 	file->offset += ret;
@@ -550,42 +558,23 @@ int FileSaveConfig(const char *name, void *pBuffer, int size)
 	return FileSave(path, pBuffer, size);
 }
 
+int FileSaveJoymap(const char *name, void *pBuffer, int size)
+{
+	char path[256] = { CONFIG_DIR"/inputs/" };
+	FileCreatePath(path);
+	strcat(path, name);
+	return FileSave(path, pBuffer, size);
+}
+
 int FileLoad(const char *name, void *pBuffer, int size)
 {
-	if (name[0] != '/') sprintf(full_path, "%s/%s", getRootDir(), name);
-	else strcpy(full_path, name);
+	fileTYPE f;
+	if (!FileOpen(&f, name)) return 0;
 
-	int fd = open(full_path, O_RDONLY);
-	if (fd < 0)
-	{
-		printf("FileLoad(open) File:%s, error: %d.\n", full_path, fd);
-		return 0;
-	}
+	int ret = f.size;
+	if (size) ret = FileReadAdv(&f, pBuffer, size);
 
-	struct stat64 st;
-	int ret = fstat64(fd, &st);
-	if (ret < 0)
-	{
-		printf("FileLoad(fstat) File:%s, error: %d.\n", full_path, ret);
-		close(fd);
-		return 0;
-	}
-
-	if (!pBuffer)
-	{
-		close(fd);
-		return (int)st.st_size;
-	}
-
-	ret = read(fd, pBuffer, size ? size : st.st_size);
-	close(fd);
-
-	if (ret < 0)
-	{
-		printf("FileLoad(read) File:%s, error: %d.\n", full_path, ret);
-		return 0;
-	}
-
+	FileClose(&f);
 	return ret;
 }
 
@@ -596,9 +585,19 @@ int FileLoadConfig(const char *name, void *pBuffer, int size)
 	return FileLoad(path, pBuffer, size);
 }
 
+int FileLoadJoymap(const char *name, void *pBuffer, int size)
+{
+	char path[256] = { CONFIG_DIR"/inputs/" };
+	strcat(path, name);
+	int ret = FileLoad(path, pBuffer, size);
+	if (!ret)
+		return FileLoadConfig(name, pBuffer, size);
+	return ret;
+}
+
 int FileExists(const char *name)
 {
-	return !access(make_fullpath(name), F_OK);
+	return isPathRegularFile(name);
 }
 
 int FileCanWrite(const char *name)
@@ -631,9 +630,17 @@ static void create_path(const char *base_dir, const char* sub_dir)
 	mkdir(full_path, S_IRWXU | S_IRWXG | S_IRWXO);
 }
 
+void FileCreatePath(char *dir)
+{
+	if (!isPathDirectory(dir)) {
+		make_fullpath(dir);
+		mkdir(full_path, S_IRWXU | S_IRWXG | S_IRWXO);
+	}
+}
+
 void FileGenerateScreenshotName(const char *name, char *out_name, int buflen)
 {
-	create_path(SCREENSHOT_DIR, HomeDir);
+	create_path(SCREENSHOT_DIR, CoreName);
 
 	time_t t = time(NULL);
 	struct tm tm = *localtime(&t);
@@ -641,13 +648,13 @@ void FileGenerateScreenshotName(const char *name, char *out_name, int buflen)
 	if (tm.tm_year >= 119) // 2019 or up considered valid time
 	{
 		strftime(datecode, 31, "%Y%m%d_%H%M%S", &tm);
-		snprintf(out_name, buflen, "%s/%s/%s-%s.png", SCREENSHOT_DIR, HomeDir, datecode, name[0] ? name : SCREENSHOT_DEFAULT);
+		snprintf(out_name, buflen, "%s/%s/%s-%s.png", SCREENSHOT_DIR, CoreName, datecode, name[0] ? name : SCREENSHOT_DEFAULT);
 	}
 	else
 	{
 		for (int i = 1; i < 10000; i++)
 		{
-			snprintf(out_name, buflen, "%s/%s/NODATE-%s_%04d.png", SCREENSHOT_DIR, HomeDir, name[0] ? name : SCREENSHOT_DEFAULT, i);
+			snprintf(out_name, buflen, "%s/%s/NODATE-%s_%04d.png", SCREENSHOT_DIR, CoreName, name[0] ? name : SCREENSHOT_DEFAULT, i);
 			if (!getFileType(out_name)) return;
 		}
 	}
@@ -655,9 +662,9 @@ void FileGenerateScreenshotName(const char *name, char *out_name, int buflen)
 
 void FileGenerateSavePath(const char *name, char* out_name)
 {
-	create_path(SAVE_DIR, HomeDir);
+	create_path(SAVE_DIR, CoreName);
 
-	sprintf(out_name, "%s/%s/", SAVE_DIR, HomeDir);
+	sprintf(out_name, "%s/%s/", SAVE_DIR, CoreName);
 	char *fname = out_name + strlen(out_name);
 
 	const char *p = strrchr(name, '/');
@@ -691,6 +698,60 @@ uint32_t getFileType(const char *name)
 	if (stat64(full_path, &st)) return 0;
 
 	return st.st_mode;
+}
+
+void prefixGameDir(char *dir, size_t dir_len)
+{
+	// Searches for the core's folder in the following order:
+	// /media/fat
+	// /media/usb<0..5>
+	// /media/usb<0..5>/games
+	// /media/fat/cifs
+	// /media/fat/cifs/games
+	// /media/fat/games/
+	// if the core folder is not found anywhere,
+	// it will be created in /media/fat/games/<dir>
+	if (isPathDirectory(dir)) {
+		printf("Found existing: %s\n", dir);
+		return;
+	}
+
+	static char temp_dir[1024];
+
+	for (int x = 0; x < 6; x++) {
+		snprintf(temp_dir, 1024, "%s%d/%s", "../usb", x, dir);
+		if (isPathDirectory(temp_dir)) {
+			printf("Found USB dir: %s\n", temp_dir);
+			strncpy(dir, temp_dir, dir_len);
+			return;
+		}
+
+		snprintf(temp_dir, 1024, "%s%d/%s/%s", "../usb", x, GAMES_DIR, dir);
+		if (isPathDirectory(temp_dir)) {
+			printf("Found USB dir: %s\n", temp_dir);
+			strncpy(dir, temp_dir, dir_len);
+			return;
+		}
+	}
+
+	snprintf(temp_dir, 1024, "%s/%s", CIFS_DIR, dir);
+	if (isPathDirectory(temp_dir)) {
+		printf("Found CIFS dir: %s\n", temp_dir);
+		strncpy(dir, temp_dir, dir_len);
+		return;
+	}
+
+	snprintf(temp_dir, 1024, "%s/%s/%s", CIFS_DIR, GAMES_DIR, dir);
+	if (isPathDirectory(temp_dir)) {
+		printf("Found CIFS dir: %s\n", temp_dir);
+		strncpy(dir, temp_dir, dir_len);
+		return;
+	}
+
+	FileCreatePath((char *) GAMES_DIR);
+	snprintf(temp_dir, 1024, "%s/%s", GAMES_DIR, dir);
+	strncpy(dir, temp_dir, dir_len);
+	printf("Prefixed dir to %s\n", temp_dir);
 }
 
 static int device = 0;
@@ -861,10 +922,13 @@ struct DirentComp
 {
 	bool operator()(const direntext_t& de1, const direntext_t& de2)
 	{
+
+#ifdef USE_SCHEDULER
 		if (++iterations % YieldIterations == 0)
 		{
 			scheduler_yield();
 		}
+#endif
 
 		if ((de1.de.d_type == DT_DIR) && !strcmp(de1.altname, "..")) return true;
 		if ((de2.de.d_type == DT_DIR) && !strcmp(de2.altname, "..")) return false;
@@ -927,6 +991,7 @@ static bool IsInSameFolder(const char *folder, const char *path)
 int ScanDirectory(char* path, int mode, const char *extension, int options, const char *prefix)
 {
 	static char file_name[1024];
+	static char full_path[1024];
 
 	int has_trd = 0;
 	const char *ext = extension;
@@ -936,12 +1001,6 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 		ext += 3;
 	}
 
-	const char* is_zipped = strcasestr(path, ".zip");
-	if (is_zipped && strcasestr(is_zipped + 4, ".zip"))
-	{
-		printf("Nested zip-files are not supported: %s\n", path);
-		return 0;
-	}
 	int extlen = strlen(extension);
 
 	//printf("scan dir\n");
@@ -949,8 +1008,6 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 	if (mode == SCANF_INIT)
 	{
 		file_name[0] = 0;
-		if (options & SCANO_NEOGEO) neogeo_scan_xml();
-
 		if ((options & SCANO_NOENTER) || !isPathDirectory(path))
 		{
 			char *p = strrchr(path, '/');
@@ -972,8 +1029,17 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 			file_name[0] = 0;
 		}
 
+		if (options & SCANO_NEOGEO) neogeo_scan_xml(path);
+
 		sprintf(full_path, "%s/%s", getRootDir(), path);
 		int path_len = strlen(full_path);
+
+		const char* is_zipped = strcasestr(full_path, ".zip");
+		if (is_zipped && strcasestr(is_zipped + 4, ".zip"))
+		{
+			printf("Nested zip-files are not supported: %s\n", full_path);
+			return 0;
+		}
 
 		printf("Start to scan %sdir: %s\n", is_zipped ? "zipped " : "", full_path);
 		printf("Position on item: %s\n", file_name);
@@ -1011,11 +1077,12 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 		for (size_t i = 0; (d && (de = readdir(d)))
 				 || (z && i < mz_zip_reader_get_num_files(z)); i++)
 		{
+#ifdef USE_SCHEDULER
 			if (0 < i && i % YieldIterations == 0)
 			{
 				scheduler_yield();
 			}
-
+#endif
 			struct dirent _de = {};
 			if (z) {
 				mz_zip_reader_get_filename(z, i, &_de.d_name[0], sizeof(_de.d_name));
@@ -1062,7 +1129,16 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 
 			if (options & SCANO_NEOGEO)
 			{
-				if (de->d_type != DT_DIR) continue;
+				if (de->d_type == DT_REG && !strcasecmp(de->d_name + strlen(de->d_name) - 4, ".zip"))
+				{
+					de->d_type = DT_DIR;
+				}
+
+				if (strcasecmp(de->d_name + strlen(de->d_name) - 4, ".neo"))
+				{
+					if (de->d_type != DT_DIR) continue;
+				}
+
 				if (!strcmp(de->d_name, ".."))
 				{
 					if (!strlen(path)) continue;
@@ -1075,11 +1151,14 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 
 				direntext_t dext = { *de, 0, "" };
 				memcpy(dext.altname, de->d_name, sizeof(dext.altname));
+				if (!strcasecmp(dext.altname + strlen(dext.altname) - 4, ".zip")) dext.altname[strlen(dext.altname) - 4] = 0;
 
 				full_path[path_len] = 0;
-				char *altname = neogeo_get_altname(full_path, de->d_name);
+				char *altname = neogeo_get_altname(full_path, &dext);
 				if (altname)
 				{
+					if (altname == (char*)-1) continue;
+
 					dext.de.d_type = DT_REG;
 					memcpy(dext.altname, altname, sizeof(dext.altname));
 				}
@@ -1224,7 +1303,7 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 		if (flist_nDirEntries() == 0) // directory is empty so there is no point in searching for any entry
 			return 0;
 
-		if (mode == SCANF_END)
+		if (mode == SCANF_END || (mode == SCANF_PREV && iSelectedEntry <= 0))
 		{
 			iSelectedEntry = flist_nDirEntries() - 1;
 			iFirstEntry = iSelectedEntry - OsdGetSize() + 1;
@@ -1238,7 +1317,13 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 				iSelectedEntry++;
 				if (iSelectedEntry > iFirstEntry + OsdGetSize() - 1) iFirstEntry = iSelectedEntry - OsdGetSize() + 1;
 			}
-			return 0;
+            else
+            {
+				// jump to first visible item
+				iFirstEntry = 0;
+				iSelectedEntry = 0;
+            }
+            return 0;
 		}
 		else if (mode == SCANF_PREV)
 		{
@@ -1247,7 +1332,7 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 				iSelectedEntry--;
 				if (iSelectedEntry < iFirstEntry) iFirstEntry = iSelectedEntry;
 			}
-			return 0;
+            return 0;
 		}
 		else if (mode == SCANF_NEXT_PAGE)
 		{
