@@ -59,6 +59,7 @@ int  getStorage(int from_setting);
 void setStorage(int dev);
 int  isUSBMounted();
 
+int  FileOpenZip(fileTYPE *file, const char *name, uint32_t crc32);
 int  FileOpenEx(fileTYPE *file, const char *name, int mode, char mute = 0);
 int  FileOpen(fileTYPE *file, const char *name, char mute = 0);
 void FileClose(fileTYPE *file);
@@ -72,13 +73,17 @@ int FileReadAdv(fileTYPE *file, void *pBuffer, int length);
 int FileReadSec(fileTYPE *file, void *pBuffer);
 int FileWriteAdv(fileTYPE *file, void *pBuffer, int length);
 int FileWriteSec(fileTYPE *file, void *pBuffer);
-void FileCreatePath(char *dir);
+void FileCreatePath(const char *dir);
 
 int FileExists(const char *name);
 int FileCanWrite(const char *name);
+int PathIsDir(const char *name);
 
 #define SAVE_DIR "saves"
 void FileGenerateSavePath(const char *name, char* out_name);
+
+#define SAVESTATE_DIR "savestates"
+void FileGenerateSavestatePath(const char *name, char* out_name);
 
 #define SCREENSHOT_DIR "screenshots"
 #define SCREENSHOT_DEFAULT "screen"
@@ -99,6 +104,7 @@ void AdjustDirectory(char *path);
 int ScanDirectory(char* path, int mode, const char *extension, int options, const char *prefix = NULL);
 
 void prefixGameDir(char *dir, size_t dir_len);
+int findPrefixDir(char *dir, size_t dir_len);
 
 const char *getStorageDir(int dev);
 const char *getRootDir();

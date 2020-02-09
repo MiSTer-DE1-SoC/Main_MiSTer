@@ -990,6 +990,7 @@ enum QUIRK
 	QUIRK_DS3,
 	QUIRK_DS4,
 	QUIRK_DS4TOUCH,
+	QUIRK_MADCATZ360,
 };
 
 typedef struct
@@ -1017,6 +1018,9 @@ typedef struct
 
 	int      accx, accy;
 	int      quirk;
+
+	int      misc_flags;
+	int      mc_a;
 
 	int      lightgun_req;
 	int      lightgun;
@@ -1477,6 +1481,7 @@ static void mouse_cb(unsigned char b, int16_t x = 0, int16_t y = 0, int16_t w = 
 
 static void joy_digital(int jnum, uint32_t mask, uint32_t code, char press, int bnum, int dont_save = 0)
 {
+	static uint32_t osdbtn = 0;
 	static char str[128];
 	static uint32_t lastcode[NUMPLAYERS], lastmask[NUMPLAYERS];
 	int num = jnum - 1;
@@ -1591,8 +1596,41 @@ static void joy_digital(int jnum, uint32_t mask, uint32_t code, char press, int 
 			return;
 		}
 
+		// clear OSD button state if not in the OSD.  this avoids problems where buttons are still held
+		// on OSD exit and causes combinations to match when partial buttons are pressed.
+		if (!user_io_osd_is_visible()) osdbtn = 0;
+
 		if (user_io_osd_is_visible() || (bnum == BTN_OSD))
 		{
+			if (press)
+			{
+				osdbtn |= mask;
+				if (mask & (JOY_BTN1 | JOY_BTN2)) {
+					if ((osdbtn & (JOY_BTN1 | JOY_BTN2)) == (JOY_BTN1 | JOY_BTN2))
+					{
+						osdbtn |= JOY_BTN3;
+						mask = JOY_BTN3;
+					}
+				}
+			}
+			else
+			{
+				int old_osdbtn = osdbtn;
+				osdbtn &= ~mask;
+
+				if (mask & (JOY_BTN1 | JOY_BTN2)) {
+					if ((old_osdbtn & (JOY_BTN1 | JOY_BTN2 | JOY_BTN3)) == (JOY_BTN1 | JOY_BTN2 | JOY_BTN3))
+					{
+						mask = JOY_BTN3;
+					}
+					else if (old_osdbtn & JOY_BTN3)
+					{
+						if (!(osdbtn & (JOY_BTN1 | JOY_BTN2))) osdbtn &= ~JOY_BTN3;
+						mask = 0;
+					}
+				}
+			}
+
 			memset(joy, 0, sizeof(joy));
 			struct input_event ev;
 			ev.type = EV_KEY;
@@ -1757,6 +1795,10 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 			}
 			input[dev].has_map++;
 		}
+		else
+		{
+			map_joystick_show(input[dev].map, input[dev].mmap);
+		}
 		input[dev].has_map++;
 	}
 
@@ -1806,6 +1848,8 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 	//mapping
 	if (mapping && (mapping_dev >= 0 || ev->value) && !((mapping_type < 2 || !mapping_button) && (cancel || enter)))
 	{
+		int idx = 0;
+
 		if (is_menu_core())
 		{
 			spi_uio_cmd(UIO_KEYBOARD); //ping the Menu core to wakeup
@@ -1865,7 +1909,7 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 				}
 
 				mapping_clear = 0;
-				if (mapping_dev >= 0 && (mapping_dev == dev || clear) && mapping_button < (is_menu_core() ? (SYS_BTN_OSD_KTGL+1) : mapping_count))
+				if (mapping_dev >= 0 && (mapping_dev == dev || clear) && mapping_button < (is_menu_core() ? (mapping_type ? SYS_BTN_CNT_ESC + 1 : SYS_BTN_OSD_KTGL + 1) : mapping_count))
 				{
 					if (ev->value == 1 && !key_mapped)
 					{
@@ -1877,12 +1921,21 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 								input[dev].osd_combo = 0;
 
 								int found = 0;
-								for (int i = (mapping_button >= BUTTON_DPAD_COUNT) ? BUTTON_DPAD_COUNT : 0; i < mapping_button; i++) if (input[dev].map[i] == ev->code) found = 1;
+								if (mapping_button < SYS_BTN_CNT_OK)
+								{
+									for (int i = (mapping_button >= BUTTON_DPAD_COUNT) ? BUTTON_DPAD_COUNT : 0; i < mapping_button; i++) if (input[dev].map[i] == ev->code) found = 1;
+								}
 
 								if (!found || (mapping_button == SYS_BTN_OSD_KTGL && mapping_type))
 								{
-									input[dev].map[(mapping_button == SYS_BTN_OSD_KTGL) ? SYS_BTN_OSD_KTGL + mapping_type : mapping_button] = ev->code;
-									input[dev].map[SYS_BTN_OSD_KTGL + 2] = input[dev].map[SYS_BTN_OSD_KTGL + 1];
+									if (mapping_button == SYS_BTN_CNT_OK) input[dev].map[SYS_BTN_MENU_FUNC] = ev->code & 0xFFFF;
+									else if (mapping_button == SYS_BTN_CNT_ESC) input[dev].map[SYS_BTN_MENU_FUNC] = (ev->code << 16) | input[dev].map[SYS_BTN_MENU_FUNC];
+									else if (mapping_button == SYS_BTN_OSD_KTGL)
+									{
+										input[dev].map[SYS_BTN_OSD_KTGL + mapping_type] = ev->code;
+										input[dev].map[SYS_BTN_OSD_KTGL + 2] = input[dev].map[SYS_BTN_OSD_KTGL + 1];
+									}
+									else input[dev].map[mapping_button] = ev->code;
 
 									key_mapped = ev->code;
 
@@ -1950,21 +2003,16 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 					{
 						last_axis = 0;
 					}
-					return;
 				}
 			}
 		}
-
-		//Define min-0-max analogs
-		int idx = 0;
-		if (is_menu_core())
+		else if (is_menu_core())
 		{
+			//Define min-0-max analogs
 			switch (mapping_button)
 			{
-				case 21: idx = SYS_AXIS_X;  break;
-				case 22: idx = SYS_AXIS_Y;  break;
-				case 23: idx = SYS_AXIS_MX; break;
-				case 24: idx = SYS_AXIS_MY; break;
+				case 23: idx = SYS_AXIS_X;  break;
+				case 24: idx = SYS_AXIS_Y;  break;
 				case -4: idx = SYS_AXIS1_X; break;
 				case -3: idx = SYS_AXIS1_Y; break;
 				case -2: idx = SYS_AXIS2_X; break;
@@ -2064,23 +2112,29 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 			}
 		}
 
-		if (mapping_type <= 1 && map_skip && mapping_button < mapping_count)
+		while (mapping_type <= 1 && mapping_button < mapping_count)
 		{
-			if (ev->value == 1)
+			if (map_skip)
 			{
-				if (mapping_dev >= 0)
+				if (map_skip == 2 || ev->value == 1)
 				{
-					if (idx) input[mapping_dev].map[idx] = 0;
-					else if (mapping_button > 0)
+					if (mapping_dev >= 0)
 					{
-						if (is_menu_core()) input[mapping_dev].map[mapping_button] = 0;
-						else input[mapping_dev].map[mapping_button] &= mapping_set ? 0x0000FFFF : 0xFFFF0000;
+						if (idx) input[mapping_dev].map[idx] = 0;
+						else if (mapping_button > 0)
+						{
+							if (!is_menu_core()) input[mapping_dev].map[mapping_button] &= mapping_set ? 0x0000FFFF : 0xFFFF0000;
+						}
 					}
+					last_axis = 0;
+					mapping_button++;
+					if (mapping_button < 0 && (mapping_button & 1)) mapping_button++;
 				}
-				last_axis = 0;
-				mapping_button++;
-				if (mapping_button < 0 && (mapping_button&1)) mapping_button++;
 			}
+
+			map_skip = 0;
+			if (mapping_button >= 4 && !is_menu_core() && !strcmp(joy_bnames[mapping_button - 4], "-")) map_skip = 2;
+			if (!map_skip) break;
 		}
 
 		if (is_menu_core() && mapping_type <= 1 && mapping_dev >= 0)
@@ -2137,7 +2191,31 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 				{
 					if (ev->value <= 1)
 					{
-						for (int i = 0; i <= SYS_BTN_Y; i++)
+						if ((input[dev].mmap[SYS_BTN_MENU_FUNC] & 0xFFFF) ?
+							(ev->code == (input[dev].mmap[SYS_BTN_MENU_FUNC] & 0xFFFF)) :
+							(ev->code == input[dev].mmap[SYS_BTN_A]))
+						{
+							joy_digital(0, JOY_BTN1, 0, ev->value, 0);
+							return;
+						}
+
+						if ((input[dev].mmap[SYS_BTN_MENU_FUNC] >> 16) ?
+							(ev->code == (input[dev].mmap[SYS_BTN_MENU_FUNC] >> 16)) :
+							(ev->code == input[dev].mmap[SYS_BTN_B]))
+						{
+							joy_digital(0, JOY_BTN2, 0, ev->value, 0);
+							return;
+						}
+
+						if (ev->code == input[dev].mmap[SYS_BTN_SELECT])
+						{
+							struct input_event key_ev = *ev;
+							key_ev.code = KEY_GRAVE;
+							input_cb(&key_ev, 0, 0);
+							return;
+						}
+
+						for (int i = 0; i < SYS_BTN_A; i++)
 						{
 							if (ev->code == input[dev].mmap[i])
 							{
@@ -2613,6 +2691,12 @@ int input_test(int getchar)
 							input[n].lightgun = 1;
 						}
 
+						//Madcatz Arcade Stick 360
+						if (input[n].vid == 0x0738 && input[n].pid == 0x4758)
+						{
+							input[n].quirk = QUIRK_MADCATZ360;
+						}
+
 						ioctl(pool[n].fd, EVIOCGRAB, (grabbed | user_io_osd_is_visible()) ? 1 : 0);
 
 						n++;
@@ -2738,8 +2822,6 @@ int input_test(int getchar)
 							}
 							else if (ev.type)
 							{
-								if (ev.type == EV_KEY && ev.value > 1) continue;
-
 								int dev = i;
 								if (input[dev].bind >= 0) dev = input[dev].bind;
 
@@ -2750,8 +2832,54 @@ int input_test(int getchar)
 									if (ev.code == BTN_TOOL_FINGER || ev.code == BTN_TOUCH || ev.code == BTN_TOOL_DOUBLETAP) continue;
 								}
 
+								if (input[i].quirk == QUIRK_MADCATZ360 && ev.type == EV_KEY)
+								{
+									if (ev.code == BTN_THUMBR) input[i].misc_flags = ev.value ? (input[i].misc_flags | 1) : (input[i].misc_flags & ~1);
+									else if (ev.code == BTN_MODE && !user_io_osd_is_visible())
+									{
+										if (input[i].misc_flags & 1)
+										{
+											if (ev.value)
+											{
+												if ((input[i].misc_flags & 0x6) == 0) input[i].misc_flags = 0x3; // X
+												else if ((input[i].misc_flags & 0x6) == 2) input[i].misc_flags = 0x5; // Y
+												else input[i].misc_flags = 0x1; // None
+
+												Info(((input[i].misc_flags & 0x6) == 2) ? "Paddle: X" :
+													((input[i].misc_flags & 0x6) == 4) ? "Paddle: Y" :
+													"Paddle: Off");
+											}
+											continue;
+										}
+									}
+								}
+
 								if (ev.type == EV_ABS)
 								{
+									if (input[i].quirk == QUIRK_MADCATZ360 && (input[i].misc_flags & 0x6))
+									{
+										//disable original analog axis to avoid conflicts
+										if (ev.code <= 1) continue;
+
+										if (ev.code == 16)
+										{
+											if (ev.value)
+											{
+												if (ev.value > 0) input[i].mc_a += 8;
+												if (ev.value < 0) input[i].mc_a -= 8;
+
+												if (input[i].mc_a > 128) input[i].mc_a = 128;
+												if (input[i].mc_a < -128) input[i].mc_a = -128;
+
+												ev.code = (input[i].misc_flags >> 2) & 1;
+												ev.value = input[i].mc_a * 256;
+												if (ev.value > 32767) ev.value = 32767;
+												//printf("** %d - %d\n", ev.code, ev.value);
+											}
+											else continue;
+										}
+									}
+
 									if (input[i].quirk == QUIRK_WIIMOTE)
 									{
 										//nunchuck accel events
@@ -3254,4 +3382,73 @@ void input_switch(int grab)
 int input_state()
 {
 	return grabbed;
+}
+
+static char ovr_buttons[1024] = {};
+static char ovr_nmap[1024] = {};
+static char ovr_pmap[1024] = {};
+
+static char *get_btn(int type)
+{
+	int i = 2;
+	while (1)
+	{
+		char *p = user_io_get_confstr(i);
+		if (!p) break;
+
+		if ((p[0] == 'J' && !type) || (p[0] == 'j' && ((p[1] == 'n' && type == 1) || (p[1] == 'p' && type == 2))))
+		{
+			p = strchr(p, ',');
+			if (!p) break;
+
+			p++;
+			if (!strlen(p)) break;
+			return p;
+		}
+
+		i++;
+	}
+	return NULL;
+}
+
+char *get_buttons(int type)
+{
+	if (type == 0 && ovr_buttons[0]) return ovr_buttons;
+	if (type == 1 && ovr_nmap[0]) return ovr_nmap;
+	if (type == 2 && ovr_pmap[0]) return ovr_pmap;
+
+	return get_btn(type);
+}
+
+void set_ovr_buttons(char *s, int type)
+{
+	switch (type)
+	{
+	case 0:
+		snprintf(ovr_buttons, sizeof(ovr_buttons), "%s", s);
+		break;
+
+	case 1:
+		snprintf(ovr_nmap, sizeof(ovr_nmap), "%s", s);
+		break;
+
+	case 2:
+		snprintf(ovr_pmap, sizeof(ovr_pmap), "%s", s);
+		break;
+	}
+}
+
+void parse_buttons()
+{
+	joy_bcount = 0;
+
+	char *str = get_buttons();
+	if (!str) return;
+
+	for (int n = 0; n < 28; n++)
+	{
+		substrcpy(joy_bnames[n], str, n);
+		if (!joy_bnames[n][0]) break;
+		joy_bcount++;
+	}
 }

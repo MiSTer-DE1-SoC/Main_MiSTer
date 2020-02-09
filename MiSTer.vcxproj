@@ -72,12 +72,14 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="menu.cpp" />
     <ClCompile Include="osd.cpp" />
+    <ClCompile Include="recent.cpp" />
     <ClCompile Include="scaler.cpp" />
     <ClCompile Include="scheduler.cpp" />
     <ClCompile Include="spi.cpp" />
     <ClCompile Include="support\arcade\buffer.cpp" />
     <ClCompile Include="support\arcade\romutils.cpp" />
     <ClCompile Include="support\archie\archie.cpp" />
+    <ClCompile Include="support\c64\c64.cpp" />
     <ClCompile Include="support\megacd\cdd.cpp" />
     <ClCompile Include="support\megacd\megacd.cpp" />
     <ClCompile Include="support\minimig\minimig_boot.cpp" />
@@ -127,6 +129,7 @@
     <ClInclude Include="logo.h" />
     <ClInclude Include="menu.h" />
     <ClInclude Include="osd.h" />
+    <ClInclude Include="recent.h" />
     <ClInclude Include="scaler.h" />
     <ClInclude Include="scheduler.h" />
     <ClInclude Include="spi.h" />
@@ -134,6 +137,7 @@
     <ClInclude Include="support\arcade\buffer.h" />
     <ClInclude Include="support\arcade\romutils.h" />
     <ClInclude Include="support\archie\archie.h" />
+    <ClInclude Include="support\c64\c64.h" />
     <ClInclude Include="support\megacd\megacd.h" />
     <ClInclude Include="support\minimig\minimig_boot.h" />
     <ClInclude Include="support\minimig\minimig_config.h" />

@@ -65,7 +65,7 @@ struct fileZipArchive
 	__off64_t                         offset;
 };
 
-static bool FileIsZipped(char* path, char** zip_path, char** file_path)
+static int FileIsZipped(char* path, char** zip_path, char** file_path)
 {
 	char* z = strcasestr(path, ".zip");
 	if (z)
@@ -76,9 +76,10 @@ static bool FileIsZipped(char* path, char** zip_path, char** file_path)
 
 		if (zip_path) *zip_path = path;
 		if (file_path) *file_path = z;
-		return true;
+		return 1;
 	}
-	return false;
+
+	return 0;
 }
 
 static char* make_fullpath(const char *path, int mode = 0)
@@ -102,7 +103,7 @@ static int get_stmode(const char *path)
 	return (stat64(path, &st) < 0) ? 0 : st.st_mode;
 }
 
-static bool isPathDirectory(char *path)
+static bool isPathDirectory(const char *path)
 {
 	make_fullpath(path);
 
@@ -235,6 +236,87 @@ void FileClose(fileTYPE *file)
 	file->filp = nullptr;
 }
 
+static int zip_search_by_crc(mz_zip_archive *zipArchive, uint32_t crc32)
+{
+	for (unsigned int file_index = 0; file_index < zipArchive->m_total_files; file_index++)
+	{
+		mz_zip_archive_file_stat s;
+		if (mz_zip_reader_file_stat(zipArchive, file_index, &s))
+		{
+			if (s.m_crc32 == crc32)
+			{
+				return file_index;
+			}
+		}
+	}
+
+	return -1;
+}
+
+int FileOpenZip(fileTYPE *file, const char *name, uint32_t crc32)
+{
+	make_fullpath(name);
+	FileClose(file);
+	file->mode = 0;
+	file->type = 0;
+
+	char *p = strrchr(full_path, '/');
+	strcpy(file->name, (p) ? p + 1 : full_path);
+
+	char *zip_path, *file_path;
+	if (!FileIsZipped(full_path, &zip_path, &file_path))
+	{
+		printf("FileOpenZip: %s, is not a zip.\n", full_path);
+		return 0;
+	}
+
+	file->zip = new fileZipArchive{};
+	if (!mz_zip_reader_init_file(&file->zip->archive, zip_path, 0))
+	{
+		printf("FileOpenZip(mz_zip_reader_init_file) Zip:%s, error:%s\n", zip_path,
+					mz_zip_get_error_string(mz_zip_get_last_error(&file->zip->archive)));
+		return 0;
+	}
+
+	file->zip->index = -1;
+	if (crc32) file->zip->index = zip_search_by_crc(&file->zip->archive, crc32);
+	if (file->zip->index < 0) file->zip->index = mz_zip_reader_locate_file(&file->zip->archive, file_path, NULL, 0);
+	if (file->zip->index < 0)
+	{
+		printf("FileOpenZip(mz_zip_reader_locate_file) Zip:%s, file:%s, error: %s\n",
+					zip_path, file_path,
+					mz_zip_get_error_string(mz_zip_get_last_error(&file->zip->archive)));
+		FileClose(file);
+		return 0;
+	}
+
+	mz_zip_archive_file_stat s;
+	if (!mz_zip_reader_file_stat(&file->zip->archive, file->zip->index, &s))
+	{
+		printf("FileOpenZip(mz_zip_reader_file_stat) Zip:%s, file:%s, error:%s\n",
+					zip_path, file_path,
+					mz_zip_get_error_string(mz_zip_get_last_error(&file->zip->archive)));
+		FileClose(file);
+		return 0;
+	}
+	file->size = s.m_uncomp_size;
+
+	file->zip->iter = mz_zip_reader_extract_iter_new(&file->zip->archive, file->zip->index, 0);
+	if (!file->zip->iter)
+	{
+		printf("FileOpenZip(mz_zip_reader_extract_iter_new) Zip:%s, file:%s, error:%s\n",
+					zip_path, file_path,
+					mz_zip_get_error_string(mz_zip_get_last_error(&file->zip->archive)));
+		FileClose(file);
+		return 0;
+	}
+
+	file->zip->offset = 0;
+	file->offset = 0;
+	file->mode = O_RDONLY;
+	return 1;
+}
+
 int FileOpenEx(fileTYPE *file, const char *name, int mode, char mute)
 {
 	make_fullpath((char*)name, mode);
@@ -299,7 +381,7 @@ int FileOpenEx(fileTYPE *file, const char *name, int mode, char mute)
 	}
 	else
 	{
-		int fd = (mode == -1) ? shm_open("/vtrd", O_CREAT | O_RDWR | O_TRUNC, 0777) : open(full_path, mode, 0777);
+		int fd = (mode == -1) ? shm_open("/vdsk", O_CREAT | O_RDWR | O_TRUNC, 0777) : open(full_path, mode, 0777);
 		if (fd <= 0)
 		{
 			if(!mute) printf("FileOpenEx(open) File:%s, error: %s.\n", full_path, strerror(errno));
@@ -572,7 +654,7 @@ int FileLoad(const char *name, void *pBuffer, int size)
 	if (!FileOpen(&f, name)) return 0;
 
 	int ret = f.size;
-	if (size) ret = FileReadAdv(&f, pBuffer, size);
+	if (pBuffer) ret = FileReadAdv(&f, pBuffer, size ? size : f.size);
 
 	FileClose(&f);
 	return ret;
@@ -598,6 +680,11 @@ int FileLoadJoymap(const char *name, void *pBuffer, int size)
 int FileExists(const char *name)
 {
 	return isPathRegularFile(name);
+}
+
+int PathIsDir(const char *name)
+{
+	return isPathDirectory(name);
 }
 
 int FileCanWrite(const char *name)
@@ -630,7 +717,7 @@ static void create_path(const char *base_dir, const char* sub_dir)
 	mkdir(full_path, S_IRWXU | S_IRWXG | S_IRWXO);
 }
 
-void FileCreatePath(char *dir)
+void FileCreatePath(const char *dir)
 {
 	if (!isPathDirectory(dir)) {
 		make_fullpath(dir);
@@ -690,6 +777,36 @@ void FileGenerateSavePath(const char *name, char* out_name)
 	printf("SavePath=%s\n", out_name);
 }
 
+void FileGenerateSavestatePath(const char *name, char* out_name)
+{
+	create_path(SAVESTATE_DIR, CoreName);
+
+	sprintf(out_name, "%s/%s/", SAVESTATE_DIR, CoreName);
+	char *fname = out_name + strlen(out_name);
+
+	const char *p = strrchr(name, '/');
+	if (p)
+	{
+		strcat(fname, p + 1);
+	}
+	else
+	{
+		strcat(fname, name);
+	}
+
+	char *e = strrchr(fname, '.');
+	if (e)
+	{
+		strcpy(e, ".ss");
+	}
+	else
+	{
+		strcat(fname, ".ss");
+	}
+
+	printf("SavestatePath=%s\n", out_name);
+}
+
 uint32_t getFileType(const char *name)
 {
 	sprintf(full_path, "%s/%s", getRootDir(), name);
@@ -700,7 +817,7 @@ uint32_t getFileType(const char *name)
 	return st.st_mode;
 }
 
-void prefixGameDir(char *dir, size_t dir_len)
+int findPrefixDir(char *dir, size_t dir_len)
 {
 	// Searches for the core's folder in the following order:
 	// /media/fat
@@ -713,7 +830,7 @@ void prefixGameDir(char *dir, size_t dir_len)
 	// it will be created in /media/fat/games/<dir>
 	if (isPathDirectory(dir)) {
 		printf("Found existing: %s\n", dir);
-		return;
+		return 1;
 	}
 
 	static char temp_dir[1024];
@@ -723,14 +840,14 @@ void prefixGameDir(char *dir, size_t dir_len)
 		if (isPathDirectory(temp_dir)) {
 			printf("Found USB dir: %s\n", temp_dir);
 			strncpy(dir, temp_dir, dir_len);
-			return;
+			return 1;
 		}
 
 		snprintf(temp_dir, 1024, "%s%d/%s/%s", "../usb", x, GAMES_DIR, dir);
 		if (isPathDirectory(temp_dir)) {
 			printf("Found USB dir: %s\n", temp_dir);
 			strncpy(dir, temp_dir, dir_len);
-			return;
+			return 1;
 		}
 	}
 
@@ -738,20 +855,37 @@ void prefixGameDir(char *dir, size_t dir_len)
 	if (isPathDirectory(temp_dir)) {
 		printf("Found CIFS dir: %s\n", temp_dir);
 		strncpy(dir, temp_dir, dir_len);
-		return;
+		return 1;
 	}
 
 	snprintf(temp_dir, 1024, "%s/%s/%s", CIFS_DIR, GAMES_DIR, dir);
 	if (isPathDirectory(temp_dir)) {
 		printf("Found CIFS dir: %s\n", temp_dir);
 		strncpy(dir, temp_dir, dir_len);
-		return;
+		return 1;
 	}
 
-	FileCreatePath((char *) GAMES_DIR);
 	snprintf(temp_dir, 1024, "%s/%s", GAMES_DIR, dir);
-	strncpy(dir, temp_dir, dir_len);
-	printf("Prefixed dir to %s\n", temp_dir);
+	if (isPathDirectory(temp_dir)) {
+		printf("Found dir: %s\n", temp_dir);
+		strncpy(dir, temp_dir, dir_len);
+		return 1;
+	}
+
+	return 0;
+}
+
+void prefixGameDir(char *dir, size_t dir_len)
+{
+	if (!findPrefixDir(dir, dir_len))
+	{
+		static char temp_dir[1024];
+
+		FileCreatePath(GAMES_DIR);
+		snprintf(temp_dir, 1024, "%s/%s", GAMES_DIR, dir);
+		strncpy(dir, temp_dir, dir_len);
+		printf("Prefixed dir to %s\n", temp_dir);
+	}
 }
 
 static int device = 0;
@@ -1154,7 +1288,7 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 				if (!strcasecmp(dext.altname + strlen(dext.altname) - 4, ".zip")) dext.altname[strlen(dext.altname) - 4] = 0;
 
 				full_path[path_len] = 0;
-				char *altname = neogeo_get_altname(full_path, &dext);
+				char *altname = neogeo_get_altname(full_path, dext.de.d_name, dext.altname);
 				if (altname)
 				{
 					if (altname == (char*)-1) continue;

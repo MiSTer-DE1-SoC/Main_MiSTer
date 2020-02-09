@@ -74,6 +74,7 @@
 #define UIO_SET_GAMCURV 0x33  // Set Gamma curve
 #define UIO_CD_GET      0x34
 #define UIO_CD_SET      0x35
+#define UIO_INFO_GET    0x36
 
 // codes as used by 8bit for file loading from OSD
 #define UIO_FILE_TX     0x53
@@ -148,6 +149,7 @@
 #define CONF_VGA_SOG            0b0000001000000000
 #define CONF_DIRECT_VIDEO       0b0000010000000000
 #define CONF_HDMI_LIMITED2      0b0000100000000000
+#define CONF_VGA_FB             0b0001000000000000
 
 // core type value should be unlikely to be returned by broken cores
 #define CORE_TYPE_UNKNOWN   0x55
@@ -220,6 +222,7 @@ char *user_io_make_filepath(const char *path, const char *filename);
 char *user_io_get_core_name();
 char *user_io_get_core_path();
 const char *user_io_get_core_name_ex();
+void user_io_name_override(const char* name);
 char has_menu();
 
 const char *get_image_name(int i);
@@ -243,6 +246,8 @@ void user_io_analog_joystick(unsigned char, char, char);
 void user_io_set_joyswap(int swap);
 int user_io_get_joyswap();
 char user_io_osd_is_visible();
+void set_vga_fb(int enable);
+int get_vga_fb();
 void user_io_send_buttons(char);
 uint16_t user_io_get_sdram_cfg();
 
@@ -276,8 +281,6 @@ void diskled_on();
 #define DISKLED_ON  diskled_on()
 #define DISKLED_OFF void()
 
-void parse_cue_file(void);
-
 char is_minimig();
 char is_sharpmz();
 char is_menu_core();
@@ -286,6 +289,7 @@ char is_snes_core();
 char is_neogeo_core();
 char is_megacd_core();
 char is_archie_core();
+char is_gba_core();
 
 #define HomeDir (is_menu_core() ? "Scripts" : user_io_get_core_path())
 #define CoreName (is_menu_core() ? "Scripts" : user_io_get_core_name())
